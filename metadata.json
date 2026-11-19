@@ -1,0 +1,6 @@
+{
+  "name": "AP Reconciliation Workbench",
+  "description": "Accounts Payable invoice intake, Kenyan tax policy verification, human approval queue, and immutable ledger workbench.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
