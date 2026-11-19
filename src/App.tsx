@@ -1,59 +1,43 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  BookOpenCheck,
-  FileSearch,
-  RotateCcw,
-  ShieldCheck,
-  UserCheck,
-} from "lucide-react";
-import type {
-  ExtractedInvoiceFields,
-  ReconciliationThread,
-  WorkbenchState,
-} from "./types";
-import { StepIntake } from "./components/StepIntake";
-import { StepPolicy } from "./components/StepPolicy";
-import { StepApprovals } from "./components/StepApprovals";
+import { BookOpenCheck, Database, RotateCcw, Sparkles } from "lucide-react";
+import type { PolicyCategory, ReconciliationThread, WorkbenchState } from "./types";
+import { InvestigationWorkspace } from "./components/InvestigationWorkspace";
+import { PolicyKnowledgeBase } from "./components/PolicyKnowledgeBase";
 import { StepLedger } from "./components/StepLedger";
 
-type StepKey = "intake" | "policy" | "approvals" | "ledger";
+type ViewKey = "investigate" | "policies" | "ledger";
 
-const NAV_STEPS: {
-  key: StepKey;
+const NAV_ITEMS: {
+  key: ViewKey;
   label: string;
-  shortTitle: string;
-  icon: typeof FileSearch;
+  breadcrumb: string;
+  icon: typeof Sparkles;
 }[] = [
   {
-    key: "intake",
-    label: "1. Intake & Extract",
-    shortTitle: "Step 1: Intake & Extract",
-    icon: FileSearch,
+    key: "investigate",
+    label: "1. AI Investigation",
+    breadcrumb: "AI Investigation Workspace",
+    icon: Sparkles,
   },
   {
-    key: "policy",
-    label: "2. Match & Policy",
-    shortTitle: "Step 2: Match & Tax Policy",
-    icon: ShieldCheck,
-  },
-  {
-    key: "approvals",
-    label: "3. Approval Queue",
-    shortTitle: "Step 3: Human Approval Queue",
-    icon: UserCheck,
+    key: "policies",
+    label: "2. Policy Vector DB",
+    breadcrumb: "Firm AP Policies & Vector Store",
+    icon: Database,
   },
   {
     key: "ledger",
-    label: "4. Ledger & Audit",
-    shortTitle: "Step 4: Ledger & Audit Trail",
+    label: "3. Ledger & Audit",
+    breadcrumb: "SQLite Ledger & Append-Only Audit",
     icon: BookOpenCheck,
   },
 ];
 
 export default function App() {
-  const [step, setStep] = useState<StepKey>("intake");
+  const [view, setView] = useState<ViewKey>("investigate");
   const [state, setState] = useState<WorkbenchState | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [highlightPolicyId, setHighlightPolicyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -82,7 +66,7 @@ export default function App() {
     setError(null);
     try {
       const res = await fetch("/api/workbench/reset", { method: "POST" });
-      if (!res.ok) throw new Error("Failed to reset demo data.");
+      if (!res.ok) throw new Error("Failed to reset SQLite ledger.");
       const data = (await res.json()) as WorkbenchState;
       setState(data);
       setSelectedThreadId(data.threads[0]?.thread_id ?? null);
@@ -93,52 +77,28 @@ export default function App() {
     }
   }
 
-  async function handleReconcileText(rawInput: string): Promise<ReconciliationThread | null> {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/reconcile", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rawInput }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Reconciliation request failed.");
-      setState(data.state);
-      setSelectedThreadId(data.thread.thread_id);
-      return data.thread as ReconciliationThread;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Reconciliation failed.");
-      return null;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleExtractInvoice(payload: {
+  async function handleInvestigate(payload: {
     base64Data?: string;
     mimeType?: string;
     documentText?: string;
     fileName?: string;
-  }): Promise<{ extracted: ExtractedInvoiceFields; thread: ReconciliationThread } | null> {
+    engine: "gemini" | "ollama";
+  }): Promise<ReconciliationThread | null> {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/extract-invoice", {
+      const res = await fetch("/api/investigate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Document extraction failed.");
+      if (!res.ok) throw new Error(data.error || "Investigation pipeline failed.");
       setState(data.state);
       setSelectedThreadId(data.thread.thread_id);
-      return {
-        extracted: data.extracted as ExtractedInvoiceFields,
-        thread: data.thread as ReconciliationThread,
-      };
+      return data.thread as ReconciliationThread;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Document extraction failed.");
+      setError(err instanceof Error ? err.message : "Investigation failed.");
       return null;
     } finally {
       setBusy(false);
@@ -169,13 +129,47 @@ export default function App() {
     }
   }
 
-  const activeNav = NAV_STEPS.find((s) => s.key === step) ?? NAV_STEPS[0];
+  async function handleSavePolicy(payload: {
+    policy_id: string;
+    category: PolicyCategory;
+    title: string;
+    vendor_scope: string | null;
+    rule_text: string;
+  }): Promise<boolean> {
+    try {
+      const res = await fetch("/api/policies", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to save policy.");
+      setState(data.state);
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save policy.");
+      return false;
+    }
+  }
+
+  async function handleReindexVectors() {
+    try {
+      const res = await fetch("/api/policies/reindex", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Reindex failed.");
+      setState(data.state);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reindex failed.");
+    }
+  }
+
+  const activeNav = NAV_ITEMS.find((n) => n.key === view) ?? NAV_ITEMS[0];
   const pendingCount =
     state?.threads.filter((t) => t.status === "pending_approval" || t.status === "held").length ?? 0;
 
   return (
     <div className="min-h-screen bg-[#0B1120] text-slate-100 flex flex-col lg:flex-row">
-      {/* Desktop Sidebar */}
+      {/* Left Navigation Sidebar */}
       <aside className="lg:w-64 lg:shrink-0 border-b lg:border-b-0 lg:border-r border-slate-800 bg-[#0F172A] flex flex-col justify-between">
         <div>
           <div className="px-5 py-5 border-b border-slate-800">
@@ -183,25 +177,25 @@ export default function App() {
               href="#top"
               onClick={(e) => {
                 e.preventDefault();
-                setStep("intake");
+                setView("investigate");
               }}
               className="font-display text-base font-bold tracking-tight text-slate-100 whitespace-nowrap"
             >
-              AP Reconciliation
+              AP Reconciliation AI
             </a>
           </div>
 
-          <nav aria-label="Workflow steps" className="p-3 flex lg:flex-col gap-1 overflow-x-auto">
-            {NAV_STEPS.map((item) => {
+          <nav aria-label="Primary views" className="p-3 flex lg:flex-col gap-1 overflow-x-auto">
+            {NAV_ITEMS.map((item) => {
               const Icon = item.icon;
-              const isActive = step === item.key;
+              const isActive = view === item.key;
               return (
                 <button
                   key={item.key}
                   type="button"
                   onClick={() => {
                     setError(null);
-                    setStep(item.key);
+                    setView(item.key);
                   }}
                   className={`flex items-center justify-between gap-2.5 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     isActive
@@ -213,13 +207,14 @@ export default function App() {
                     <Icon className="h-4 w-4 shrink-0" />
                     <span>{item.label}</span>
                   </span>
-                  {item.key === "approvals" && pendingCount > 0 && (
-                    <span
-                      className={`font-mono text-xs tabular-nums ${
-                        isActive ? "text-blue-100" : "text-amber-400"
-                      }`}
-                    >
+                  {item.key === "investigate" && pendingCount > 0 && (
+                    <span className={`font-mono text-xs tabular-nums ${isActive ? "text-blue-100" : "text-amber-400"}`}>
                       {pendingCount}
+                    </span>
+                  )}
+                  {item.key === "policies" && state && (
+                    <span className={`font-mono text-xs tabular-nums ${isActive ? "text-blue-100" : "text-slate-400"}`}>
+                      {state.policies.length}
                     </span>
                   )}
                 </button>
@@ -229,20 +224,20 @@ export default function App() {
         </div>
 
         <div className="hidden lg:block border-t border-slate-800 p-5 space-y-2 text-xs text-slate-400">
-          <div className="font-medium text-slate-300">Architecture Principle</div>
+          <div className="font-medium text-slate-200">Hybrid RAG + Guardrails</div>
           <p className="leading-relaxed">
-            Models read unstructured invoices and notes. Deterministic policy rules verify math, Kenyan WHVAT/WHT, and ledger state.
+            AI extracts unstructured invoices and investigates discrepancies against {state?.policies.length ?? 33} vectorized firm policies. SQLite guardrails enforce math, eTIMS, and atomic ledger writes.
           </p>
         </div>
       </aside>
 
-      {/* Main Content Shell */}
+      {/* Main Viewport */}
       <div className="flex-1 flex flex-col min-w-0">
         <header className="flex items-center justify-between gap-8 border-b border-slate-800 bg-[#0F172A]/80 px-6 py-4">
           <div className="text-sm text-slate-400 truncate">
             <span>Accounts Payable</span>
             <span className="mx-2 text-slate-600">/</span>
-            <span className="font-medium text-slate-100">{activeNav.shortTitle}</span>
+            <span className="font-medium text-slate-100">{activeNav.breadcrumb}</span>
           </div>
 
           <button
@@ -257,44 +252,41 @@ export default function App() {
         </header>
 
         <main className="flex-1 px-6 py-8 lg:px-10">
-          <div className="mx-auto max-w-6xl">
+          <div className="mx-auto max-w-7xl">
             {loading || !state ? (
               <div className="space-y-4">
                 <div className="h-8 w-64 rounded bg-slate-800/80" />
-                <div className="h-44 w-full rounded-xl bg-slate-800/50" />
+                <div className="h-52 w-full rounded-xl bg-slate-800/50" />
               </div>
             ) : (
               <>
-                {step === "intake" && (
-                  <StepIntake
-                    onReconcileText={handleReconcileText}
-                    onExtractInvoice={handleExtractInvoice}
-                    onInspectThread={(id) => {
-                      setSelectedThreadId(id);
-                      setStep("policy");
-                    }}
-                    onGoToApprovals={() => setStep("approvals")}
-                    busy={busy}
-                    error={error}
-                  />
-                )}
-                {step === "policy" && (
-                  <StepPolicy
+                {view === "investigate" && (
+                  <InvestigationWorkspace
                     threads={state.threads}
                     selectedThreadId={selectedThreadId}
                     onSelectThread={setSelectedThreadId}
-                    onGoToApprovals={() => setStep("approvals")}
-                  />
-                )}
-                {step === "approvals" && (
-                  <StepApprovals
-                    threads={state.threads}
+                    onInvestigate={handleInvestigate}
                     onSubmitDecision={handleDecision}
+                    onOpenPolicy={(policyId) => {
+                      setHighlightPolicyId(policyId);
+                      setView("policies");
+                    }}
+                    ollamaConfigured={state.telemetry.ollama_configured}
+                    ollamaModel={state.telemetry.ollama_model}
                     busy={busy}
                     error={error}
                   />
                 )}
-                {step === "ledger" && <StepLedger state={state} />}
+                {view === "policies" && (
+                  <PolicyKnowledgeBase
+                    policies={state.policies}
+                    denseVectorCount={state.telemetry.dense_vector_count}
+                    highlightPolicyId={highlightPolicyId}
+                    onSavePolicy={handleSavePolicy}
+                    onReindexVectors={handleReindexVectors}
+                  />
+                )}
+                {view === "ledger" && <StepLedger state={state} />}
               </>
             )}
           </div>

@@ -1,22 +1,20 @@
 import "dotenv/config";
-import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import { WorkbenchDB, sha16 } from "./src/db.ts";
+import { PolicyVectorStore } from "./src/vectorStore.ts";
 import type {
-  AuditEntry,
   Currency,
-  ExtractedInvoiceFields,
-  InvoiceRecord,
-  ParsedRemittanceFields,
-  PaymentRecord,
+  ExtractedDocument,
+  InvestigationBrief,
+  PolicyCategory,
   PolicyEvaluation,
-  PurchaseOrder,
   ReconciliationThread,
+  RetrievedPolicyHit,
   TaxRuleApplied,
-  WorkbenchState,
 } from "./src/types.ts";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -24,12 +22,11 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
 const MODEL_NAME = "gemini-4-hydrogen";
+const db = new WorkbenchDB();
 
-function getGeminiClient(): GoogleGenAI {
+function getOptionalGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured in environment secrets.");
-  }
+  if (!apiKey) return null;
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -40,336 +37,19 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-// --- Deterministic Kenyan & USD AP Seed Data ---
-function buildInitialState(): {
-  purchase_orders: PurchaseOrder[];
-  invoices: InvoiceRecord[];
-  payments: PaymentRecord[];
-  threads: ReconciliationThread[];
-  audit_log: AuditEntry[];
-  nextAuditId: number;
-  telemetryRuns: { latency_ms: number; human_override: boolean }[];
-} {
-  const purchase_orders: PurchaseOrder[] = [
-    {
-      po_number: "PO-4410",
-      vendor_name: "Acacia Hardware Ltd",
-      kra_pin: "P051234987K",
-      currency: "KES",
-      authorized_amount: 116000,
-      status: "open",
-    },
-    {
-      po_number: "PO-4412",
-      vendor_name: "Mombasa Logistics Ltd",
-      kra_pin: "P051883210M",
-      currency: "KES",
-      authorized_amount: 232000,
-      status: "open",
-    },
-    {
-      po_number: "PO-4415",
-      vendor_name: "Rift Valley Cloud Services",
-      kra_pin: "P051449012R",
-      currency: "USD",
-      authorized_amount: 1450,
-      status: "open",
-    },
-    {
-      po_number: "PO-4418",
-      vendor_name: "Savannah Steel Works Ltd",
-      kra_pin: "P051774509S",
-      currency: "KES",
-      authorized_amount: 58000,
-      status: "open",
-    },
-  ];
-
-  const invoices: InvoiceRecord[] = [
-    {
-      invoice_number: "INV-9001",
-      po_number: "PO-4410",
-      vendor_name: "ACACIA HDW",
-      currency: "KES",
-      subtotal: 100000,
-      vat: 16000,
-      total: 116000,
-      etims_cu: "KRA-CU-01948271",
-      invoice_date: "14/11/2026",
-      status: "held",
-      sha256: sha("INV-9001|PO-4410|116000"),
-    },
-    {
-      invoice_number: "INV-9002",
-      po_number: "PO-4415",
-      vendor_name: "Rift Valley Cloud Services",
-      currency: "USD",
-      subtotal: 1450,
-      vat: 0,
-      total: 1450,
-      etims_cu: "KRA-CU-01948399",
-      invoice_date: "15/11/2026",
-      status: "held",
-      sha256: sha("INV-9002|PO-4415|1450"),
-    },
-    {
-      invoice_number: "INV-9004",
-      po_number: "PO-4412",
-      vendor_name: "Mombasa Logistics Ltd",
-      currency: "KES",
-      subtotal: 200000,
-      vat: 32000,
-      total: 232000,
-      etims_cu: "KRA-CU-01948504",
-      invoice_date: "12/11/2026",
-      status: "open",
-      sha256: sha("INV-9004|PO-4412|232000"),
-    },
-    {
-      invoice_number: "INV-9006",
-      po_number: "PO-4418",
-      vendor_name: "Savannah Steel Works Ltd",
-      currency: "KES",
-      subtotal: 50000,
-      vat: 8000,
-      total: 58000,
-      etims_cu: "KRA-CU-01948611",
-      invoice_date: "10/11/2026",
-      status: "reconciled",
-      sha256: sha("INV-9006|PO-4418|58000"),
-    },
-  ];
-
-  const payments: PaymentRecord[] = [
-    {
-      payment_ref: "MPESA-QKL8821",
-      vendor_name: "Acacia Hardware",
-      invoice_number: "INV-9001",
-      currency: "KES",
-      amount: 114000, // 2% WHVAT withheld (2,000 KES)
-      channel: "M-Pesa",
-      paid_at: "16/11/2026",
-      status: "unmatched",
-    },
-    {
-      payment_ref: "WIRE-USD-441",
-      vendor_name: "Rift Valley Cloud",
-      invoice_number: "INV-9002",
-      currency: "USD",
-      amount: 1450,
-      channel: "Wire",
-      paid_at: "16/11/2026",
-      status: "unmatched",
-    },
-    {
-      payment_ref: "EFT-77319",
-      vendor_name: "Mombasa Logistics Ltd",
-      invoice_number: "INV-9004",
-      currency: "KES",
-      amount: 215000, // Short paid by 17,000 KES (outside tolerance)
-      channel: "EFT",
-      paid_at: "17/11/2026",
-      status: "unmatched",
-    },
-    {
-      payment_ref: "MPESA-RZP1104",
-      vendor_name: "Savannah Steel Works Ltd",
-      invoice_number: "INV-9006",
-      currency: "KES",
-      amount: 58000,
-      channel: "M-Pesa",
-      paid_at: "11/11/2026",
-      status: "reconciled",
-    },
-  ];
-
-  const threads: ReconciliationThread[] = [
-    {
-      thread_id: "thr-inv9001-whvat",
-      created_at: "2026-11-16T09:14:00Z",
-      source_type: "remittance_text",
-      raw_summary: "Tumelipa Acacia HDW invoice 9001 via Mpesa QKL8821 baada ya 2% WHVAT.",
-      invoice_number: "INV-9001",
-      vendor_name: "ACACIA HDW",
-      po_number: "PO-4410",
-      payment_refs: ["MPESA-QKL8821"],
-      currency: "KES",
-      invoice_amount: 116000,
-      paid_amount: 114000,
-      variance_amount: 2000,
-      variance_pct: 1.72,
-      status: "pending_approval",
-      reviewer: null,
-      review_note: null,
-      evaluation: {
-        arithmetic_ok: true,
-        arithmetic_diff: 0,
-        etims_valid: true,
-        duplicate_hash: false,
-        vendor_match_score: 79,
-        vendor_match_label: "Low Confidence",
-        po_found: true,
-        payment_count: 1,
-        invoice_amount: 116000,
-        paid_amount: 114000,
-        variance_amount: 2000,
-        variance_pct: 1.72,
-        tax_rule_applied: "whvat_2pct",
-        expected_withheld_amount: 2000,
-        high_value_flag: false,
-        outcome: "pending_approval",
-        reasons: [
-          "2% Kenyan WHVAT deduction detected (KES 2,000 on KES 100,000 net): confirm WHT certificate before clearing.",
-          "Fuzzy vendor match 'ACACIA HDW' vs PO 'Acacia Hardware Ltd' scored 79% (below 82% auto-clear threshold).",
-        ],
-      },
-      extraction_meta: {
-        model: MODEL_NAME,
-        latency_ms: 412,
-      },
-    },
-    {
-      thread_id: "thr-inv9002-wire",
-      created_at: "2026-11-16T11:30:00Z",
-      source_type: "remittance_text",
-      raw_summary: "Confirm Rift Valley Cloud USD wire WIRE-USD-441 against INV-9002.",
-      invoice_number: "INV-9002",
-      vendor_name: "Rift Valley Cloud Services",
-      po_number: "PO-4415",
-      payment_refs: ["WIRE-USD-441"],
-      currency: "USD",
-      invoice_amount: 1450,
-      paid_amount: 1450,
-      variance_amount: 0,
-      variance_pct: 0,
-      status: "pending_approval",
-      reviewer: null,
-      review_note: null,
-      evaluation: {
-        arithmetic_ok: true,
-        arithmetic_diff: 0,
-        etims_valid: true,
-        duplicate_hash: false,
-        vendor_match_score: 100,
-        vendor_match_label: "Exact",
-        po_found: true,
-        payment_count: 1,
-        invoice_amount: 1450,
-        paid_amount: 1450,
-        variance_amount: 0,
-        variance_pct: 0,
-        tax_rule_applied: "none",
-        expected_withheld_amount: 0,
-        high_value_flag: true,
-        outcome: "pending_approval",
-        reasons: [
-          "High-value USD invoice ($1,450.00 >= $1,000.00 threshold) requires supervisor sign-off.",
-        ],
-      },
-      extraction_meta: {
-        model: "deterministic",
-        latency_ms: 4,
-      },
-    },
-    {
-      thread_id: "thr-inv9006-clear",
-      created_at: "2026-11-11T14:05:00Z",
-      source_type: "remittance_text",
-      raw_summary: "Reconcile INV-9006 with MPESA-RZP1104 KES",
-      invoice_number: "INV-9006",
-      vendor_name: "Savannah Steel Works Ltd",
-      po_number: "PO-4418",
-      payment_refs: ["MPESA-RZP1104"],
-      currency: "KES",
-      invoice_amount: 58000,
-      paid_amount: 58000,
-      variance_amount: 0,
-      variance_pct: 0,
-      status: "reconciled",
-      reviewer: "Policy Engine (Auto)",
-      review_note: "Zero variance within tolerance; eTIMS verified.",
-      evaluation: {
-        arithmetic_ok: true,
-        arithmetic_diff: 0,
-        etims_valid: true,
-        duplicate_hash: false,
-        vendor_match_score: 100,
-        vendor_match_label: "Exact",
-        po_found: true,
-        payment_count: 1,
-        invoice_amount: 58000,
-        paid_amount: 58000,
-        variance_amount: 0,
-        variance_pct: 0,
-        tax_rule_applied: "none",
-        expected_withheld_amount: 0,
-        high_value_flag: false,
-        outcome: "auto_reconciled",
-        reasons: [
-          "All deterministic checks passed: arithmetic, eTIMS CU, PO match, exact payment.",
-        ],
-      },
-      extraction_meta: {
-        model: "deterministic",
-        latency_ms: 3,
-      },
-    },
-  ];
-
-  const audit_log: AuditEntry[] = [
-    {
-      id: 1,
-      thread_id: "thr-inv9006-clear",
-      step_name: "ledger_finalizer",
-      decision: "reconciled",
-      summary: "INV-9006 cleared automatically with MPESA-RZP1104 (KES 58,000).",
-      created_at: "2026-11-11T14:05:02Z",
-      details: { invoice_number: "INV-9006", variance: 0, currency: "KES" },
-    },
-    {
-      id: 2,
-      thread_id: "thr-inv9001-whvat",
-      step_name: "policy_critic",
-      decision: "pending_approval",
-      summary: "INV-9001 held for 2% WHVAT confirmation and 79% fuzzy vendor match.",
-      created_at: "2026-11-16T09:14:01Z",
-      details: { tax_rule_applied: "whvat_2pct", vendor_match_score: 79 },
-    },
-    {
-      id: 3,
-      thread_id: "thr-inv9002-wire",
-      step_name: "policy_critic",
-      decision: "pending_approval",
-      summary: "INV-9002 held for supervisor approval (USD 1,450 >= USD 1,000 limit).",
-      created_at: "2026-11-16T11:30:01Z",
-      details: { high_value_flag: true, amount: 1450, currency: "USD" },
-    },
-  ];
-
-  return {
-    purchase_orders,
-    invoices,
-    payments,
-    threads,
-    audit_log,
-    nextAuditId: 4,
-    telemetryRuns: [
-      { latency_ms: 412, human_override: false },
-      { latency_ms: 4, human_override: false },
-      { latency_ms: 3, human_override: false },
-    ],
-  };
+function requireGeminiClient(): GoogleGenAI {
+  const client = getOptionalGeminiClient();
+  if (!client) {
+    throw new Error("GEMINI_API_KEY is not configured in environment secrets.");
+  }
+  return client;
 }
 
-function sha(input: string): string {
-  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
-}
+const vectorStore = new PolicyVectorStore(db, getOptionalGeminiClient);
 
-let store = buildInitialState();
-
-// --- Deterministic Utility Functions ---
+// --- Deterministic Kenyan Policy & Math Guardrails ---
 function normalizeVendor(name: string): string[] {
-  const stop = new Set(["ltd", "limited", "inc", "co", "kenya", "ke", "plc"]);
+  const stop = new Set(["ltd", "limited", "inc", "co", "kenya", "ke", "plc", "llp"]);
   const aliases: Record<string, string> = {
     hdw: "hardware",
     svcs: "services",
@@ -424,23 +104,10 @@ function scoreVendorMatch(a: string | null, b: string | null): {
 
 function isValidEtims(cu: string | null): boolean {
   if (!cu) return false;
-  return /^(KRA-)?CU-\d{6,12}$/i.test(cu.trim()) || /^CU\d{6,12}$/i.test(cu.trim());
+  return /^(KRA-)?CU-?\d{6,14}$/i.test(cu.trim());
 }
 
-function regexParseRemittance(raw: string): ParsedRemittanceFields {
-  const invMatch = raw.match(/\b(INV-\d{3,6})\b/i);
-  const payMatch = raw.match(/\b((?:MPESA|EFT|WIRE)-[A-Z0-9-]+)\b/i);
-  const curMatch = raw.match(/\b(KES|USD)\b/i);
-  return {
-    invoice_number: invMatch ? invMatch[1].toUpperCase() : null,
-    payment_ref: payMatch ? payMatch[1].toUpperCase() : null,
-    vendor_name: null,
-    currency: curMatch ? (curMatch[1].toUpperCase() as Currency) : null,
-    wht_mentioned: /\b(whvat|wht|withholding)\b/i.test(raw),
-  };
-}
-
-function evaluateDeterministicPolicy(params: {
+function evaluateDeterministicGuardrails(params: {
   invoice_number: string | null;
   po_number: string | null;
   vendor_name: string | null;
@@ -453,79 +120,99 @@ function evaluateDeterministicPolicy(params: {
   payment_count: number;
   duplicate_hash: boolean;
   already_reconciled: boolean;
+  is_receipt: boolean;
 }): PolicyEvaluation {
   const reasons: string[] = [];
-  const arithmetic_diff = Number((params.subtotal + params.vat - params.total).toFixed(2));
-  const arithmetic_ok = Math.abs(arithmetic_diff) <= 1.0 && params.total > 0;
+  const purchaseOrders = db.getPurchaseOrders();
+
+  let arithmetic_diff = 0;
+  let arithmetic_ok = params.total > 0;
+  if (!params.is_receipt && (params.subtotal > 0 || params.vat > 0)) {
+    arithmetic_diff = Number((params.subtotal + params.vat - params.total).toFixed(2));
+    arithmetic_ok = Math.abs(arithmetic_diff) <= 1.0 && params.total > 0;
+  }
   if (!arithmetic_ok) {
     reasons.push(
-      `Arithmetic check failed: subtotal (${params.subtotal}) + VAT (${params.vat}) != total (${params.total}).`
+      `Arithmetic guardrail triggered: subtotal (${params.subtotal}) + VAT (${params.vat}) != total (${params.total}), diff = ${arithmetic_diff}.`
     );
   }
 
   const etims_valid = isValidEtims(params.etims_cu);
-  if (!etims_valid) {
-    reasons.push("Missing or malformed KRA eTIMS Control Unit number (expected KRA-CU-XXXXXXXX).");
+  if (!params.is_receipt && params.currency === "KES" && !etims_valid) {
+    reasons.push("Missing or malformed KRA eTIMS Control Unit number (POL-TAX-007).");
   }
 
   if (params.duplicate_hash) {
-    reasons.push("Duplicate document SHA-256 hash detected in ledger.");
+    reasons.push("Duplicate document SHA-256 hash already present in SQLite intake_documents (POL-CTRL-003).");
   }
   if (params.already_reconciled) {
-    reasons.push(`Invoice ${params.invoice_number} is already reconciled; monotonic ledger rule blocks re-posting.`);
+    reasons.push(`Invoice ${params.invoice_number} is already reconciled; monotonic ledger lock prevents re-posting.`);
   }
 
   const po = params.po_number
-    ? store.purchase_orders.find((p) => p.po_number.toUpperCase() === params.po_number?.toUpperCase())
+    ? purchaseOrders.find((p) => p.po_number.toUpperCase() === params.po_number?.toUpperCase())
     : undefined;
   const po_found = Boolean(po);
+  const goods_received = Boolean(po && po.goods_received === 1);
   if (!po_found) {
-    reasons.push("No matching Purchase Order found in ledger.");
+    reasons.push("No matching Purchase Order found in ledger (POL-CTRL-005).");
+  } else if (!goods_received) {
+    reasons.push(`Purchase Order ${po?.po_number} has not recorded goods receipt (POL-MATCH-001).`);
   }
 
   const vendorScore = po
     ? scoreVendorMatch(params.vendor_name, po.vendor_name)
-    : { score: params.vendor_name ? 50 : 0, label: (params.vendor_name ? "Low Confidence" : "Missing") as PolicyEvaluation["vendor_match_label"] };
+    : {
+        score: params.vendor_name ? 50 : 0,
+        label: (params.vendor_name ? "Low Confidence" : "Missing") as PolicyEvaluation["vendor_match_label"],
+      };
 
   if (po && vendorScore.score < 82) {
     reasons.push(
-      `Vendor match '${params.vendor_name ?? "unknown"}' vs PO '${po.vendor_name}' scored ${vendorScore.score}% (below 82% threshold).`
+      `Vendor match '${params.vendor_name ?? "unknown"}' vs PO '${po.vendor_name}' scored ${vendorScore.score}% (below 82% threshold, POL-MATCH-008).`
     );
   }
 
   const variance_amount = Number((params.total - params.paid_amount).toFixed(2));
   const variance_pct = params.total > 0 ? Number(((Math.abs(variance_amount) / params.total) * 100).toFixed(2)) : 0;
 
-  const expectedWhvat = Number((params.subtotal * 0.02).toFixed(2));
-  const expectedWht = Number((params.subtotal * 0.05).toFixed(2));
+  const netSubtotal = params.subtotal > 0 ? params.subtotal : Number((params.total / 1.16).toFixed(2));
+  const expectedWhvat = Number((netSubtotal * 0.02).toFixed(2));
+  const expectedWht5 = Number((netSubtotal * 0.05).toFixed(2));
+  const expectedWht3 = Number((netSubtotal * 0.03).toFixed(2));
   const tolTax = params.currency === "KES" ? 5 : 0.5;
 
   let tax_rule_applied: TaxRuleApplied = "none";
   let expected_withheld_amount = 0;
 
-  if (params.payment_count > 0 && params.subtotal > 0) {
+  if (params.payment_count > 0 && netSubtotal > 0) {
     if (Math.abs(variance_amount - expectedWhvat) <= tolTax) {
       tax_rule_applied = "whvat_2pct";
       expected_withheld_amount = expectedWhvat;
       reasons.push(
-        `2% Kenyan WHVAT deduction detected (${params.currency} ${expectedWhvat.toLocaleString()}): confirm WHT certificate before clearing.`
+        `2% Kenyan WHVAT deduction detected (${params.currency} ${expectedWhvat.toLocaleString()} on net ${netSubtotal.toLocaleString()}): confirm WHT certificate (POL-TAX-003).`
       );
-    } else if (Math.abs(variance_amount - expectedWht) <= tolTax) {
+    } else if (Math.abs(variance_amount - expectedWht5) <= tolTax) {
       tax_rule_applied = "wht_5pct";
-      expected_withheld_amount = expectedWht;
+      expected_withheld_amount = expectedWht5;
       reasons.push(
-        `5% Resident WHT deduction detected (${params.currency} ${expectedWht.toLocaleString()}): confirm WHT certificate before clearing.`
+        `5% Resident WHT deduction detected (${params.currency} ${expectedWht5.toLocaleString()} on net ${netSubtotal.toLocaleString()}): confirm WHT certificate (POL-TAX-004).`
+      );
+    } else if (Math.abs(variance_amount - expectedWht3) <= tolTax) {
+      tax_rule_applied = "wht_3pct";
+      expected_withheld_amount = expectedWht3;
+      reasons.push(
+        `3% Contractual WHT deduction detected (${params.currency} ${expectedWht3.toLocaleString()} on net ${netSubtotal.toLocaleString()}): confirm WHT certificate (POL-TAX-005).`
       );
     }
   }
 
   const absTol = params.currency === "KES" ? 500 : 5;
   const withinTolerance =
-    params.payment_count > 0 &&
-    (Math.abs(variance_amount) <= absTol || variance_pct <= 1.5);
+    params.payment_count > 0 && (Math.abs(variance_amount) <= absTol || variance_pct <= 1.5);
 
   if (params.payment_count === 0) {
-    reasons.push("No matching payment found in bank/M-Pesa settlement table.");
+    reasons.push("No settled payment found in SQLite payments table.");
   } else if (!withinTolerance && tax_rule_applied === "none") {
     reasons.push(
       `Payment variance of ${params.currency} ${Math.abs(variance_amount).toLocaleString()} (${variance_pct}%) exceeds policy tolerance (1.5% or ${params.currency} ${absTol}).`
@@ -536,7 +223,7 @@ function evaluateDeterministicPolicy(params: {
   const high_value_flag = params.total >= highValueThreshold;
   if (high_value_flag) {
     reasons.push(
-      `High-value invoice (${params.currency} ${params.total.toLocaleString()} >= ${params.currency} ${highValueThreshold.toLocaleString()}) requires supervisor approval.`
+      `High-value amount (${params.currency} ${params.total.toLocaleString()} >= ${params.currency} ${highValueThreshold.toLocaleString()}) requires supervisor sign-off (POL-CTRL-001).`
     );
   }
 
@@ -544,8 +231,9 @@ function evaluateDeterministicPolicy(params: {
   if (!arithmetic_ok || params.duplicate_hash || params.already_reconciled) {
     outcome = "blocked";
   } else if (
-    !etims_valid ||
+    (!params.is_receipt && params.currency === "KES" && !etims_valid) ||
     !po_found ||
+    !goods_received ||
     params.payment_count === 0 ||
     vendorScore.score < 82 ||
     high_value_flag ||
@@ -554,17 +242,19 @@ function evaluateDeterministicPolicy(params: {
   ) {
     outcome = "pending_approval";
   } else {
-    reasons.push("All deterministic checks passed: arithmetic, eTIMS CU, PO match, vendor match, and payment tolerance.");
+    reasons.push("All deterministic guardrails passed: arithmetic, eTIMS CU, 3-way PO match, vendor match, and tolerance.");
   }
 
   return {
     arithmetic_ok,
     arithmetic_diff,
-    etims_valid,
+    etims_valid: params.is_receipt || params.currency === "USD" ? true : etims_valid,
     duplicate_hash: params.duplicate_hash,
+    already_reconciled: params.already_reconciled,
     vendor_match_score: vendorScore.score,
     vendor_match_label: vendorScore.label,
     po_found,
+    goods_received,
     payment_count: params.payment_count,
     invoice_amount: params.total,
     paid_amount: params.paid_amount,
@@ -578,294 +268,427 @@ function evaluateDeterministicPolicy(params: {
   };
 }
 
-function appendAudit(
-  thread_id: string,
-  step_name: string,
-  decision: string,
-  summary: string,
-  details: Record<string, unknown>
-) {
-  store.audit_log.unshift({
-    id: store.nextAuditId++,
-    thread_id,
-    step_name,
-    decision,
-    summary,
-    created_at: new Date().toISOString(),
-    details,
+async function extractWithOllama(params: {
+  base64Data?: string;
+  mimeType?: string;
+  documentText?: string;
+}): Promise<{ extracted: ExtractedDocument; engine: string }> {
+  const baseUrl = process.env.OLLAMA_BASE_URL;
+  if (!baseUrl) {
+    throw new Error(
+      "Local Ollama is not configured (OLLAMA_BASE_URL is unset in this cloud environment). Switch to Gemini Cloud or configure OLLAMA_BASE_URL locally."
+    );
+  }
+
+  const isImage = Boolean(params.base64Data && params.mimeType?.startsWith("image/"));
+  const model = isImage
+    ? process.env.OLLAMA_VISION_MODEL || "qwen2.5vl:3b"
+    : process.env.OLLAMA_MODEL || "qwen3:4b";
+
+  const prompt =
+    "Extract supplier invoice or payment receipt fields into JSON with keys: document_type ('invoice'|'receipt'), " +
+    "invoice_number, po_number, payment_ref, vendor_name, kra_pin, currency ('KES'|'USD'), invoice_date (YYYY-MM-DD), " +
+    "etims_cu, subtotal, vat, total, line_items ([{description, quantity, unit_price, tax_rate, line_total}]), extraction_notes.";
+
+  const msg: Record<string, unknown> = {
+    role: "user",
+    content: params.documentText ? `${prompt}\n\nDocument:\n${params.documentText}` : prompt,
+  };
+  if (isImage && params.base64Data) {
+    msg.images = [params.base64Data];
+  }
+
+  const resp = await fetch(`${baseUrl.replace(/\/$/, "")}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      messages: [msg],
+      stream: false,
+      format: "json",
+      options: { temperature: 0 },
+    }),
   });
+  if (!resp.ok) {
+    throw new Error(`Ollama returned HTTP ${resp.status}`);
+  }
+  const data = (await resp.json()) as { message?: { content?: string } };
+  const parsed = JSON.parse(data.message?.content || "{}") as ExtractedDocument;
+  return { extracted: { ...parsed, line_items: parsed.line_items || [] }, engine: `ollama:${model}` };
 }
 
-function buildPublicState(): WorkbenchState {
-  const total_runs = store.telemetryRuns.length;
-  const avg_latency_ms = total_runs
-    ? Math.round(store.telemetryRuns.reduce((s, r) => s + r.latency_ms, 0) / total_runs)
-    : 0;
-  return {
-    purchase_orders: store.purchase_orders,
-    invoices: store.invoices,
-    payments: store.payments,
-    threads: store.threads,
-    audit_log: store.audit_log,
-    telemetry: {
-      total_runs,
-      avg_latency_ms,
-      auto_cleared_count: store.threads.filter((t) => t.status === "reconciled").length,
-      pending_count: store.threads.filter((t) => t.status === "pending_approval" || t.status === "held").length,
-      blocked_or_rejected_count: store.threads.filter((t) => t.status === "blocked" || t.status === "rejected").length,
-      human_override_count: store.telemetryRuns.filter((r) => r.human_override).length,
+async function extractWithGemini(params: {
+  base64Data?: string;
+  mimeType?: string;
+  documentText?: string;
+}): Promise<{ extracted: ExtractedDocument; engine: string }> {
+  const ai = requireGeminiClient();
+  const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
+  if (params.base64Data && params.mimeType) {
+    parts.push({ inlineData: { mimeType: params.mimeType, data: params.base64Data } });
+  }
+  parts.push({
+    text:
+      "Read this supplier invoice or payment receipt. Classify document_type as 'invoice' or 'receipt'. " +
+      "Extract all header fields and every line item exactly as printed without fixing arithmetic errors.\n" +
+      (params.documentText ? `Document text:\n${params.documentText}` : "Extract from the attached document."),
+  });
+
+  const response = await ai.models.generateContent({
+    model: MODEL_NAME,
+    contents: { parts },
+    config: {
+      systemInstruction:
+        "You are a precision Accounts Payable document extractor for Kenyan and USD B2B invoices and payment receipts. " +
+        "Copy numbers verbatim—never recalculate or fix a mismatched total. Normalize Kenyan DD/MM/YYYY dates to YYYY-MM-DD. " +
+        "Set null for absent fields and include brief extraction_notes on abbreviations or anomalies.",
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          document_type: { type: Type.STRING },
+          invoice_number: { type: Type.STRING, nullable: true },
+          po_number: { type: Type.STRING, nullable: true },
+          payment_ref: { type: Type.STRING, nullable: true },
+          vendor_name: { type: Type.STRING, nullable: true },
+          kra_pin: { type: Type.STRING, nullable: true },
+          currency: { type: Type.STRING, nullable: true },
+          invoice_date: { type: Type.STRING, nullable: true },
+          etims_cu: { type: Type.STRING, nullable: true },
+          subtotal: { type: Type.NUMBER, nullable: true },
+          vat: { type: Type.NUMBER, nullable: true },
+          total: { type: Type.NUMBER, nullable: true },
+          line_items: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                description: { type: Type.STRING },
+                quantity: { type: Type.NUMBER, nullable: true },
+                unit_price: { type: Type.NUMBER, nullable: true },
+                tax_rate: { type: Type.STRING, nullable: true },
+                line_total: { type: Type.NUMBER, nullable: true },
+              },
+              required: ["description"],
+            },
+          },
+          extraction_notes: { type: Type.STRING, nullable: true },
+        },
+        required: ["document_type", "line_items"],
+      },
     },
+  });
+
+  const parsed = JSON.parse((response.text ?? "{}").trim()) as ExtractedDocument;
+  return {
+    extracted: {
+      ...parsed,
+      document_type: parsed.document_type === "receipt" ? "receipt" : "invoice",
+      line_items: parsed.line_items || [],
+    },
+    engine: MODEL_NAME,
+  };
+}
+
+async function synthesizeInvestigation(params: {
+  extracted: ExtractedDocument;
+  po: Record<string, unknown> | null;
+  payments: Record<string, unknown>[];
+  evaluation: PolicyEvaluation;
+  retrievedPolicies: RetrievedPolicyHit[];
+}): Promise<InvestigationBrief> {
+  const ai = requireGeminiClient();
+  const promptPayload = {
+    extracted_document: params.extracted,
+    matched_purchase_order: params.po,
+    matched_payments: params.payments,
+    deterministic_guardrails: params.evaluation,
+    retrieved_company_policies: params.retrievedPolicies.map((p) => ({
+      policy_id: p.policy_id,
+      title: p.title,
+      vendor_scope: p.vendor_scope,
+      similarity_score: p.similarity_score,
+      rule_text: p.rule_text,
+    })),
+  };
+
+  const response = await ai.models.generateContent({
+    model: MODEL_NAME,
+    contents: JSON.stringify(promptPayload, null, 2),
+    config: {
+      systemInstruction:
+        "You are a Senior Accounts Payable Investigation Agent for a Kenyan enterprise. " +
+        "Given the extracted invoice/receipt, SQLite PO & payment records, deterministic guardrail results, and the retrieved company policies, " +
+        "diagnose the root cause in plain accountant language, cite ONLY policy_id values present in retrieved_company_policies, " +
+        "recommend 'approve', 'hold', or 'reject' (note: if deterministic outcome is 'blocked', you MUST recommend 'reject'), " +
+        "and draft a concise audit note ready for the reviewer.",
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          root_cause: { type: Type.STRING },
+          explanation: { type: Type.STRING },
+          recommended_action: { type: Type.STRING },
+          confidence_label: { type: Type.STRING },
+          cited_policies: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                policy_id: { type: Type.STRING },
+                title: { type: Type.STRING },
+                relevance_reason: { type: Type.STRING },
+              },
+              required: ["policy_id", "title", "relevance_reason"],
+            },
+          },
+          draft_audit_note: { type: Type.STRING },
+        },
+        required: [
+          "root_cause",
+          "explanation",
+          "recommended_action",
+          "confidence_label",
+          "cited_policies",
+          "draft_audit_note",
+        ],
+      },
+    },
+  });
+
+  const brief = JSON.parse((response.text ?? "{}").trim()) as InvestigationBrief;
+  const validAction =
+    params.evaluation.outcome === "blocked"
+      ? "reject"
+      : brief.recommended_action === "approve" || brief.recommended_action === "hold" || brief.recommended_action === "reject"
+      ? brief.recommended_action
+      : "hold";
+  const validConf =
+    brief.confidence_label === "High" || brief.confidence_label === "Medium" || brief.confidence_label === "Low"
+      ? brief.confidence_label
+      : "Medium";
+
+  return {
+    ...brief,
+    recommended_action: validAction,
+    confidence_label: validConf,
+    cited_policies: brief.cited_policies || [],
   };
 }
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: "12mb" }));
+  app.use(express.json({ limit: "20mb" }));
+
+  // Warm vector index asynchronously on boot without blocking server startup
+  vectorStore.syncEmbeddings().catch((err) => {
+    console.warn("Initial policy vector sync skipped:", err instanceof Error ? err.message : err);
+  });
 
   app.get("/api/workbench", (_req, res) => {
-    res.json(buildPublicState());
+    res.json(db.getState());
   });
 
-  app.post("/api/workbench/reset", (_req, res) => {
-    store = buildInitialState();
-    res.json(buildPublicState());
+  app.post("/api/workbench/reset", async (_req, res) => {
+    db.reset();
+    try {
+      await vectorStore.syncEmbeddings();
+    } catch {
+      // Non-fatal; lexical fallback still operates
+    }
+    res.json(db.getState());
   });
 
-  // Step 1A: Extract structured invoice fields from image or raw text via Gemini
-  app.post("/api/extract-invoice", async (req, res) => {
+  // Policy Vector Store Endpoints
+  app.post("/api/policies/search", async (req, res) => {
+    try {
+      const { query, topK } = req.body as { query?: string; topK?: number };
+      if (!query?.trim()) {
+        res.status(400).json({ error: "Provide a search query." });
+        return;
+      }
+      const result = await vectorStore.search(query.trim(), Math.min(20, Math.max(1, Number(topK || 6))));
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : "Vector search failed" });
+    }
+  });
+
+  app.post("/api/policies", async (req, res) => {
+    try {
+      const { policy_id, category, title, vendor_scope, rule_text, effective_date } = req.body as {
+        policy_id?: string;
+        category?: PolicyCategory;
+        title?: string;
+        vendor_scope?: string | null;
+        rule_text?: string;
+        effective_date?: string;
+      };
+      if (!policy_id?.trim() || !title?.trim() || !rule_text?.trim() || !category) {
+        res.status(400).json({ error: "policy_id, category, title, and rule_text are required." });
+        return;
+      }
+      const saved = db.upsertPolicy({
+        policy_id,
+        category,
+        title,
+        vendor_scope: vendor_scope ?? null,
+        rule_text,
+        effective_date: effective_date || new Date().toISOString().slice(0, 10),
+      });
+      const syncInfo = await vectorStore.syncEmbeddings();
+      res.json({ policy: saved, sync: syncInfo, state: db.getState() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : "Could not save policy" });
+    }
+  });
+
+  app.post("/api/policies/reindex", async (_req, res) => {
+    try {
+      const sync = await vectorStore.syncEmbeddings();
+      res.json({ sync, state: db.getState() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : "Reindex failed" });
+    }
+  });
+
+  // Full 4-Stage AI Investigation Pipeline
+  app.post("/api/investigate", async (req, res) => {
     const t0 = performance.now();
     try {
-      const { base64Data, mimeType, documentText, fileName } = req.body as {
+      const { base64Data, mimeType, documentText, fileName, engine } = req.body as {
         base64Data?: string;
         mimeType?: string;
         documentText?: string;
         fileName?: string;
+        engine?: "gemini" | "ollama";
       };
 
       if (!base64Data && !documentText?.trim()) {
-        res.status(400).json({ error: "Provide either an invoice file (image/PDF) or invoice text." });
+        res.status(400).json({ error: "Upload a receipt/invoice file or select a supplier document." });
         return;
       }
 
-      const ai = getGeminiClient();
-      const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
-      if (base64Data && mimeType) {
-        parts.push({ inlineData: { mimeType, data: base64Data } });
-      }
-      parts.push({
-        text:
-          "Extract supplier invoice fields into strict JSON. " +
-          "Use null if a field is missing; never invent numbers or invoice IDs.\n" +
-          (documentText ? `Document text:\n${documentText}` : "Extract from the attached invoice document."),
-      });
+      // Stage 1: Multimodal / Structured Document Extraction
+      const { extracted, engine: extractionEngine } =
+        engine === "ollama"
+          ? await extractWithOllama({ base64Data, mimeType, documentText })
+          : await extractWithGemini({ base64Data, mimeType, documentText });
 
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: { parts },
-        config: {
-          systemInstruction:
-            "You are a precision Accounts Payable invoice extractor for Kenyan and USD B2B invoices. " +
-            "Extract invoice_number, po_number, vendor_name, currency (KES or USD), invoice_date (DD/MM/YYYY), " +
-            "etims_cu (KRA Control Unit number like KRA-CU-01948271), subtotal, vat, and total. Return JSON only.",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              invoice_number: { type: Type.STRING, nullable: true },
-              po_number: { type: Type.STRING, nullable: true },
-              vendor_name: { type: Type.STRING, nullable: true },
-              currency: { type: Type.STRING, nullable: true },
-              invoice_date: { type: Type.STRING, nullable: true },
-              etims_cu: { type: Type.STRING, nullable: true },
-              subtotal: { type: Type.NUMBER, nullable: true },
-              vat: { type: Type.NUMBER, nullable: true },
-              total: { type: Type.NUMBER, nullable: true },
-            },
-          },
-        },
-      });
+      const isReceipt = extracted.document_type === "receipt";
+      const currency: Currency = extracted.currency?.toUpperCase() === "USD" ? "USD" : "KES";
+      const docHash = sha16(base64Data ? base64Data : documentText || fileName || String(Date.now()));
+      const duplicate_hash = db.hasDocumentHash(docHash);
 
-      const latency_ms = Math.round(performance.now() - t0);
-      const parsed = JSON.parse((response.text ?? "{}").trim()) as ExtractedInvoiceFields;
-      const currency: Currency = parsed.currency?.toUpperCase() === "USD" ? "USD" : "KES";
-      const subtotal = Number(parsed.subtotal ?? 0);
-      const vat = Number(parsed.vat ?? 0);
-      const total = Number(parsed.total ?? 0);
+      const allInvoices = db.getInvoices();
+      const allPayments = db.getPayments();
+      const allPOs = db.getPurchaseOrders();
 
-      const docHash = sha(base64Data ? base64Data.slice(0, 512) : documentText || fileName || String(Date.now()));
-      const duplicate_hash = store.invoices.some((inv) => inv.sha256 === docHash);
-      const existingInv = parsed.invoice_number
-        ? store.invoices.find((i) => i.invoice_number.toUpperCase() === parsed.invoice_number?.toUpperCase())
+      let matchedInvoice = extracted.invoice_number
+        ? db.getInvoiceByNumber(extracted.invoice_number)
         : undefined;
-      const already_reconciled = existingInv?.status === "reconciled";
+      if (isReceipt && !matchedInvoice && extracted.vendor_name) {
+        matchedInvoice = allInvoices.find(
+          (i) => i.status !== "reconciled" && scoreVendorMatch(extracted.vendor_name, i.vendor_name).score >= 75
+        );
+      }
 
-      const matchedPayments = parsed.invoice_number
-        ? store.payments.filter(
-            (p) => p.invoice_number?.toUpperCase() === parsed.invoice_number?.toUpperCase()
-          )
+      const effectiveInvoiceNo = matchedInvoice?.invoice_number || extracted.invoice_number;
+      const effectivePoNo = matchedInvoice?.po_number || extracted.po_number;
+      const effectiveVendor = extracted.vendor_name || matchedInvoice?.vendor_name || null;
+
+      const matchedPO = effectivePoNo
+        ? allPOs.find((p) => p.po_number.toUpperCase() === effectivePoNo.toUpperCase()) ?? null
+        : null;
+
+      const subtotal = Number(extracted.subtotal ?? matchedInvoice?.subtotal ?? 0);
+      const vat = Number(extracted.vat ?? matchedInvoice?.vat ?? 0);
+      const docTotal = Number(extracted.total ?? 0);
+      const invoiceTotal = matchedInvoice ? matchedInvoice.total : docTotal;
+
+      let matchedPayments = effectiveInvoiceNo
+        ? allPayments.filter((p) => p.invoice_number?.toUpperCase() === effectiveInvoiceNo.toUpperCase())
         : [];
-      const paid_amount = matchedPayments.reduce((s, p) => s + p.amount, 0);
 
-      const evaluation = evaluateDeterministicPolicy({
-        invoice_number: parsed.invoice_number,
-        po_number: parsed.po_number,
-        vendor_name: parsed.vendor_name,
+      const generatedRef =
+        extracted.payment_ref || (isReceipt ? `RCPT-${docHash.slice(0, 8).toUpperCase()}` : null);
+
+      if (isReceipt && generatedRef && docTotal > 0 && !duplicate_hash) {
+        db.upsertReceiptPayment({
+          payment_ref: generatedRef,
+          vendor_name: effectiveVendor || "Unknown Vendor",
+          invoice_number: effectiveInvoiceNo || null,
+          currency,
+          amount: docTotal,
+          channel: generatedRef.startsWith("MPESA") ? "M-Pesa" : generatedRef.startsWith("WIRE") ? "Wire" : "EFT",
+          paid_at: extracted.invoice_date || new Date().toISOString().slice(0, 10),
+          status: "unmatched",
+        });
+        matchedPayments = [
+          {
+            payment_ref: generatedRef,
+            vendor_name: effectiveVendor || "Unknown Vendor",
+            invoice_number: effectiveInvoiceNo || null,
+            currency,
+            amount: docTotal,
+            channel: "M-Pesa",
+            paid_at: extracted.invoice_date || "",
+            status: "unmatched",
+          },
+        ];
+      }
+
+      const paid_amount = isReceipt
+        ? matchedPayments.reduce((s, p) => s + p.amount, 0) || docTotal
+        : matchedPayments.reduce((s, p) => s + p.amount, 0);
+
+      const already_reconciled = Boolean(matchedInvoice && matchedInvoice.status === "reconciled");
+
+      // Stage 2: Deterministic Financial Guardrails
+      const evaluation = evaluateDeterministicGuardrails({
+        invoice_number: effectiveInvoiceNo,
+        po_number: effectivePoNo,
+        vendor_name: effectiveVendor,
         currency,
         subtotal,
         vat,
-        total,
-        etims_cu: parsed.etims_cu,
+        total: invoiceTotal > 0 ? invoiceTotal : docTotal,
+        etims_cu: extracted.etims_cu || matchedInvoice?.etims_cu || null,
         paid_amount,
         payment_count: matchedPayments.length,
         duplicate_hash,
         already_reconciled,
+        is_receipt: isReceipt,
       });
 
-      const thread_id = `thr-doc-${Date.now().toString(36)}`;
-      const threadStatus =
-        evaluation.outcome === "auto_reconciled"
-          ? "reconciled"
-          : evaluation.outcome === "blocked"
-          ? "blocked"
-          : "pending_approval";
+      // Stage 3: Vector DB Policy RAG Retrieval (gemini-embedding-2 + SQLite)
+      const ragQuery = [
+        `Document type: ${extracted.document_type}`,
+        effectiveVendor ? `Vendor: ${effectiveVendor}` : "",
+        matchedPO ? `PO Vendor: ${matchedPO.vendor_name} ${matchedPO.po_number}` : "No PO",
+        `Currency: ${currency}, Invoice total: ${invoiceTotal || docTotal}, Paid: ${paid_amount}, Variance: ${evaluation.variance_amount} (${evaluation.variance_pct}%)`,
+        `Tax rule: ${evaluation.tax_rule_applied}`,
+        evaluation.etims_valid ? "eTIMS valid" : "Missing or invalid eTIMS CU",
+        evaluation.arithmetic_ok ? "Arithmetic valid" : "Arithmetic mismatch error",
+        extracted.line_items.map((l) => l.description).join("; "),
+        evaluation.reasons.join(" "),
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-      const thread: ReconciliationThread = {
-        thread_id,
-        created_at: new Date().toISOString(),
-        source_type: "invoice_document",
-        raw_summary: fileName ? `Uploaded document: ${fileName}` : "Extracted supplier invoice document",
-        invoice_number: parsed.invoice_number,
-        vendor_name: parsed.vendor_name,
-        po_number: parsed.po_number,
-        payment_refs: matchedPayments.map((p) => p.payment_ref),
-        currency,
-        invoice_amount: total,
-        paid_amount,
-        variance_amount: evaluation.variance_amount,
-        variance_pct: evaluation.variance_pct,
-        status: threadStatus,
-        reviewer: threadStatus === "reconciled" ? "Policy Engine (Auto)" : null,
-        review_note: threadStatus === "reconciled" ? evaluation.reasons[0] : null,
+      const ragResult = await vectorStore.search(ragQuery, 6);
+
+      // Stage 4: AI Investigation Agent Synthesis grounded in SQL + Vector DB Policies
+      const investigation = await synthesizeInvestigation({
+        extracted,
+        po: matchedPO as unknown as Record<string, unknown> | null,
+        payments: matchedPayments as unknown as Record<string, unknown>[],
         evaluation,
-        extraction_meta: {
-          model: MODEL_NAME,
-          latency_ms,
-          llm_parsed: parsed,
-        },
-      };
-
-      store.threads.unshift(thread);
-      store.telemetryRuns.push({ latency_ms, human_override: false });
-
-      if (threadStatus === "reconciled" && existingInv) {
-        existingInv.status = "reconciled";
-        matchedPayments.forEach((p) => (p.status = "reconciled"));
-      }
-
-      appendAudit(
-        thread_id,
-        "intake_validator",
-        threadStatus,
-        `Document ${parsed.invoice_number || fileName || "intake"} extracted via ${MODEL_NAME} (${latency_ms}ms) -> ${threadStatus}.`,
-        { parsed, evaluation }
-      );
-
-      res.json({ extracted: parsed, thread, state: buildPublicState() });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Extraction failed";
-      res.status(500).json({ error: msg });
-    }
-  });
-
-  // Step 1B: Parse messy English / Swahili / Sheng remittance text + compare regex vs Gemini
-  app.post("/api/reconcile", async (req, res) => {
-    const t0 = performance.now();
-    try {
-      const { rawInput } = req.body as { rawInput?: string };
-      if (!rawInput?.trim()) {
-        res.status(400).json({ error: "Please enter a remittance note or payment message." });
-        return;
-      }
-
-      const regexBaseline = regexParseRemittance(rawInput);
-      const ai = getGeminiClient();
-
-      const response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: rawInput,
-        config: {
-          systemInstruction:
-            "Extract Accounts Payable reconciliation references from English, Swahili, Sheng, or mixed business text. " +
-            "Normalize invoice numbers like '9001' or 'inv 9004' to 'INV-9001' / 'INV-9004' if clearly an invoice number, " +
-            "payment references (MPESA-*, EFT-*, WIRE-*), vendor_name if mentioned, currency (KES or USD), and wht_mentioned (boolean if WHVAT/WHT/withholding tax is mentioned).",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              invoice_number: { type: Type.STRING, nullable: true },
-              payment_ref: { type: Type.STRING, nullable: true },
-              vendor_name: { type: Type.STRING, nullable: true },
-              currency: { type: Type.STRING, nullable: true },
-              wht_mentioned: { type: Type.BOOLEAN },
-            },
-            required: ["wht_mentioned"],
-          },
-        },
+        retrievedPolicies: ragResult.hits,
       });
 
       const latency_ms = Math.round(performance.now() - t0);
-      const llmParsed = JSON.parse((response.text ?? "{}").trim()) as ParsedRemittanceFields;
-
-      const invKey = llmParsed.invoice_number || regexBaseline.invoice_number;
-      const inv = invKey
-        ? store.invoices.find((i) => i.invoice_number.toUpperCase() === invKey.toUpperCase())
-        : undefined;
-
-      const matchedPayments = inv
-        ? store.payments.filter(
-            (p) =>
-              p.invoice_number?.toUpperCase() === inv.invoice_number.toUpperCase() ||
-              (llmParsed.payment_ref && p.payment_ref.toUpperCase() === llmParsed.payment_ref.toUpperCase())
-          )
-        : llmParsed.payment_ref
-        ? store.payments.filter((p) => p.payment_ref.toUpperCase() === llmParsed.payment_ref?.toUpperCase())
-        : [];
-
-      const currency: Currency =
-        inv?.currency ?? (llmParsed.currency?.toUpperCase() === "USD" ? "USD" : "KES");
-      const paid_amount = matchedPayments.reduce((s, p) => s + p.amount, 0);
-
-      const evaluation = inv
-        ? evaluateDeterministicPolicy({
-            invoice_number: inv.invoice_number,
-            po_number: inv.po_number,
-            vendor_name: inv.vendor_name,
-            currency,
-            subtotal: inv.subtotal,
-            vat: inv.vat,
-            total: inv.total,
-            etims_cu: inv.etims_cu,
-            paid_amount,
-            payment_count: matchedPayments.length,
-            duplicate_hash: false,
-            already_reconciled: inv.status === "reconciled",
-          })
-        : evaluateDeterministicPolicy({
-            invoice_number: invKey,
-            po_number: null,
-            vendor_name: llmParsed.vendor_name,
-            currency,
-            subtotal: 0,
-            vat: 0,
-            total: 0,
-            etims_cu: null,
-            paid_amount,
-            payment_count: matchedPayments.length,
-            duplicate_hash: false,
-            already_reconciled: false,
-          });
-
-      const thread_id = `thr-rem-${Date.now().toString(36)}`;
+      const thread_id = `thr-${isReceipt ? "rcpt" : "inv"}-${Date.now().toString(36)}`;
       const threadStatus =
         evaluation.outcome === "auto_reconciled"
           ? "reconciled"
@@ -873,56 +696,80 @@ async function startServer() {
           ? "blocked"
           : "pending_approval";
 
+      if (!isReceipt && effectiveInvoiceNo && !duplicate_hash && !matchedInvoice) {
+        db.upsertExtractedInvoice({
+          invoice_number: effectiveInvoiceNo.toUpperCase(),
+          po_number: effectivePoNo,
+          vendor_name: effectiveVendor || "Unknown Vendor",
+          currency,
+          subtotal,
+          vat,
+          total: docTotal,
+          etims_cu: extracted.etims_cu,
+          invoice_date: extracted.invoice_date || new Date().toISOString().slice(0, 10),
+          status: threadStatus === "reconciled" ? "reconciled" : threadStatus === "blocked" ? "rejected" : "held",
+          sha256: docHash,
+        });
+      }
+
+      if (!duplicate_hash) {
+        db.recordDocumentHash(
+          docHash,
+          fileName || `${extracted.document_type}_${effectiveInvoiceNo || "upload"}`,
+          extracted.document_type,
+          thread_id
+        );
+      }
+
       const thread: ReconciliationThread = {
         thread_id,
         created_at: new Date().toISOString(),
-        source_type: "remittance_text",
-        raw_summary: rawInput.trim(),
-        invoice_number: inv?.invoice_number ?? invKey,
-        vendor_name: inv?.vendor_name ?? llmParsed.vendor_name,
-        po_number: inv?.po_number ?? null,
+        source_type: isReceipt ? "receipt_document" : "invoice_document",
+        raw_summary: fileName || `${extracted.document_type} ${effectiveInvoiceNo || ""}`.trim(),
+        invoice_number: effectiveInvoiceNo,
+        vendor_name: effectiveVendor,
+        po_number: effectivePoNo,
         payment_refs: matchedPayments.map((p) => p.payment_ref),
         currency,
-        invoice_amount: inv?.total ?? 0,
+        invoice_amount: invoiceTotal > 0 ? invoiceTotal : docTotal,
         paid_amount,
         variance_amount: evaluation.variance_amount,
         variance_pct: evaluation.variance_pct,
         status: threadStatus,
         reviewer: threadStatus === "reconciled" ? "Policy Engine (Auto)" : null,
-        review_note: threadStatus === "reconciled" ? evaluation.reasons[0] : null,
+        review_note: threadStatus === "reconciled" ? investigation.draft_audit_note : null,
+        extracted,
+        retrieved_policies: ragResult.hits,
         evaluation,
-        extraction_meta: {
-          model: MODEL_NAME,
+        investigation,
+        engine_meta: {
+          extraction_engine: extractionEngine,
+          embedding_engine: ragResult.embedding_engine,
           latency_ms,
-          regex_baseline: regexBaseline,
-          llm_parsed: llmParsed,
+          vector_count_searched: ragResult.total_searched,
         },
       };
 
-      store.threads.unshift(thread);
-      store.telemetryRuns.push({ latency_ms, human_override: false });
-
-      if (threadStatus === "reconciled" && inv) {
-        inv.status = "reconciled";
-        matchedPayments.forEach((p) => (p.status = "reconciled"));
-      }
-
-      appendAudit(
-        thread_id,
-        "policy_critic",
-        threadStatus,
-        `Remittance parsed (${latency_ms}ms) -> ${inv?.invoice_number || "unmatched"}: ${threadStatus}.`,
-        { regexBaseline, llmParsed, evaluation }
+      db.insertThreadAndTelemetry(
+        thread,
+        latency_ms,
+        "ai_investigator",
+        `${effectiveInvoiceNo || fileName || "Document"} investigated (${latency_ms}ms) -> cited ${investigation.cited_policies.map((c) => c.policy_id).join(", ") || "none"} -> ${threadStatus}.`,
+        {
+          extracted,
+          retrieved_policy_ids: ragResult.hits.map((h) => ({ id: h.policy_id, score: h.similarity_score })),
+          evaluation,
+          investigation,
+        }
       );
 
-      res.json({ thread, state: buildPublicState() });
+      res.json({ thread, state: db.getState() });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Reconciliation failed";
+      const msg = err instanceof Error ? err.message : "Investigation pipeline failed";
       res.status(500).json({ error: msg });
     }
   });
 
-  // Step 3: Human-in-the-loop approval decision
   app.post("/api/threads/:threadId/decision", (req, res) => {
     const { threadId } = req.params;
     const { action, reviewer, note } = req.body as {
@@ -931,17 +778,6 @@ async function startServer() {
       note?: string;
     };
 
-    const thread = store.threads.find((t) => t.thread_id === threadId);
-    if (!thread) {
-      res.status(404).json({ error: "Reconciliation thread not found." });
-      return;
-    }
-    if (thread.status === "reconciled" || thread.status === "blocked") {
-      res.status(409).json({
-        error: `Thread ${threadId} is already finalized as '${thread.status}'.`,
-      });
-      return;
-    }
     if (!action || !["approve", "hold", "reject"].includes(action)) {
       res.status(400).json({ error: "Action must be approve, hold, or reject." });
       return;
@@ -951,57 +787,24 @@ async function startServer() {
       return;
     }
 
-    const nextStatus =
-      action === "approve" ? "reconciled" : action === "hold" ? "held" : "rejected";
-
-    if (action === "approve" && thread.invoice_number) {
-      const alreadyCleared = store.threads.some(
-        (t) =>
-          t.thread_id !== thread.thread_id &&
-          t.invoice_number === thread.invoice_number &&
-          t.status === "reconciled"
-      );
-      if (alreadyCleared) {
-        res.status(409).json({
-          error: `Invoice ${thread.invoice_number} is already reconciled on another thread.`,
-        });
-        return;
-      }
-      const inv = store.invoices.find((i) => i.invoice_number === thread.invoice_number);
-      if (inv) inv.status = "reconciled";
-      thread.payment_refs.forEach((ref) => {
-        const pay = store.payments.find((p) => p.payment_ref === ref);
-        if (pay) pay.status = "reconciled";
-      });
-    } else if (thread.invoice_number) {
-      const inv = store.invoices.find((i) => i.invoice_number === thread.invoice_number);
-      if (inv && inv.status !== "reconciled") {
-        inv.status = action === "hold" ? "held" : "rejected";
-      }
-    }
-
-    thread.status = nextStatus;
-    thread.reviewer = reviewer.trim();
-    thread.review_note = note?.trim() || `${action} by ${reviewer.trim()}`;
-
-    if (action === "approve") {
-      store.telemetryRuns.push({ latency_ms: 0, human_override: true });
-    }
-
-    appendAudit(
-      thread.thread_id,
-      "human_approval",
-      nextStatus,
-      `${reviewer.trim()} marked ${thread.invoice_number || thread.thread_id} as ${nextStatus}.`,
-      { reviewer: thread.reviewer, note: thread.review_note, action }
+    const result = db.applyDecision(
+      threadId,
+      action,
+      reviewer.trim(),
+      note?.trim() || `${action} by ${reviewer.trim()}`
     );
 
-    res.json({ thread, state: buildPublicState() });
+    if (!result.ok) {
+      res.status(result.code).json({ error: result.error });
+      return;
+    }
+
+    res.json({ thread: result.thread, state: db.getState() });
   });
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, allowedHosts: true },
       appType: "spa",
     });
     app.use(vite.middlewares);

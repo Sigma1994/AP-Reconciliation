@@ -21,17 +21,17 @@ export function StepLedger({ state }: StepLedgerProps) {
     <div className="space-y-8">
       <div className="max-w-2xl space-y-1.5">
         <h1 className="font-display text-2xl font-semibold tracking-tight text-slate-100">
-          Step 4. Ledger and Audit Trail
+          SQLite Ledger and Append-Only Audit Trail
         </h1>
         <p className="text-sm leading-relaxed text-slate-400">
-          Every cleared invoice, open balance, and append-only audit decision is recorded here. Reconciled invoices are locked against duplicate posting.
+          Live operational ledger in <code className="text-slate-300">data/workbench.db</code> (WAL mode). Cleared invoices are locked monotonically, and <code className="text-slate-300">audit_log</code> is protected by SQLite update/delete abort triggers.
         </p>
       </div>
 
       {/* Telemetry Summary Strip */}
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-6">
         <div className="rounded-xl border border-slate-800 bg-[#111A2E] p-4">
-          <div className="text-xs text-slate-400">Total Runs</div>
+          <div className="text-xs text-slate-400">Pipeline Runs</div>
           <div className="mt-1 font-mono text-2xl font-semibold text-slate-100 tabular-nums">
             {state.telemetry.total_runs}
           </div>
@@ -49,13 +49,19 @@ export function StepLedger({ state }: StepLedgerProps) {
           </div>
         </div>
         <div className="rounded-xl border border-slate-800 bg-[#111A2E] p-4">
-          <div className="text-xs text-slate-400">Human Overrides</div>
+          <div className="text-xs text-slate-400">Policies</div>
           <div className="mt-1 font-mono text-2xl font-semibold text-slate-100 tabular-nums">
-            {state.telemetry.human_override_count}
+            {state.telemetry.policy_count}
           </div>
         </div>
         <div className="rounded-xl border border-slate-800 bg-[#111A2E] p-4">
-          <div className="text-xs text-slate-400">Avg Extraction</div>
+          <div className="text-xs text-slate-400">Dense Vectors</div>
+          <div className="mt-1 font-mono text-2xl font-semibold text-blue-400 tabular-nums">
+            {state.telemetry.dense_vector_count}
+          </div>
+        </div>
+        <div className="rounded-xl border border-slate-800 bg-[#111A2E] p-4">
+          <div className="text-xs text-slate-400">Avg Latency</div>
           <div className="mt-1 font-mono text-2xl font-semibold text-slate-100 tabular-nums">
             {state.telemetry.avg_latency_ms} ms
           </div>
@@ -124,6 +130,74 @@ export function StepLedger({ state }: StepLedgerProps) {
               })}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      {/* Purchase Orders & Settled Payments Reference */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <div className="rounded-xl border border-slate-800 bg-[#111A2E] overflow-hidden">
+          <div className="border-b border-slate-800 px-5 py-3.5">
+            <h2 className="font-display text-sm font-semibold text-slate-100">
+              Purchase Orders ({state.purchase_orders.length})
+            </h2>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="border-b border-slate-800 bg-[#0B1120] text-slate-400">
+                <tr>
+                  <th className="px-4 py-2.5">PO</th>
+                  <th className="px-4 py-2.5">Supplier</th>
+                  <th className="px-4 py-2.5 text-right">Authorized</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800 tabular-nums">
+                {state.purchase_orders.map((po) => (
+                  <tr key={po.po_number}>
+                    <td className="px-4 py-2.5 font-mono font-semibold text-slate-200">{po.po_number}</td>
+                    <td className="px-4 py-2.5 text-slate-300">{po.vendor_name}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-slate-200">
+                      {formatMoney(po.authorized_amount, po.currency)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-800 bg-[#111A2E] overflow-hidden">
+          <div className="border-b border-slate-800 px-5 py-3.5">
+            <h2 className="font-display text-sm font-semibold text-slate-100">
+              Bank & M-Pesa Payments ({state.payments.length})
+            </h2>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="border-b border-slate-800 bg-[#0B1120] text-slate-400">
+                <tr>
+                  <th className="px-4 py-2.5">Payment Ref</th>
+                  <th className="px-4 py-2.5">Invoice</th>
+                  <th className="px-4 py-2.5 text-right">Amount</th>
+                  <th className="px-4 py-2.5 text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800 tabular-nums">
+                {state.payments.map((pay) => {
+                  const st = statusDisplay(pay.status);
+                  return (
+                    <tr key={pay.payment_ref}>
+                      <td className="px-4 py-2.5 font-mono font-semibold text-slate-200">{pay.payment_ref}</td>
+                      <td className="px-4 py-2.5 font-mono text-slate-400">{pay.invoice_number || "Unallocated"}</td>
+                      <td className="px-4 py-2.5 text-right font-mono text-slate-200">
+                        {formatMoney(pay.amount, pay.currency)}
+                      </td>
+                      <td className={`px-4 py-2.5 text-right font-medium ${st.textClass}`}>{st.label}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 
