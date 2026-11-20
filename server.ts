@@ -272,7 +272,12 @@ async function extractWithOllama(params: {
   base64Data?: string;
   mimeType?: string;
   documentText?: string;
-}): Promise<{ extracted: ExtractedDocument; engine: string }> {
+}): Promise<{
+  extracted: ExtractedDocument;
+  engine: string;
+  responseId: string | null;
+  tokens: { prompt: number; output: number; total: number } | null;
+}> {
   const baseUrl = process.env.OLLAMA_BASE_URL;
   if (!baseUrl) {
     throw new Error(
@@ -312,16 +317,33 @@ async function extractWithOllama(params: {
   if (!resp.ok) {
     throw new Error(`Ollama returned HTTP ${resp.status}`);
   }
-  const data = (await resp.json()) as { message?: { content?: string } };
+  const data = (await resp.json()) as {
+    message?: { content?: string };
+    created_at?: string;
+    prompt_eval_count?: number;
+    eval_count?: number;
+  };
   const parsed = JSON.parse(data.message?.content || "{}") as ExtractedDocument;
-  return { extracted: { ...parsed, line_items: parsed.line_items || [] }, engine: `ollama:${model}` };
+  const pTok = Number(data.prompt_eval_count ?? 0);
+  const oTok = Number(data.eval_count ?? 0);
+  return {
+    extracted: { ...parsed, line_items: parsed.line_items || [] },
+    engine: `ollama:${model}`,
+    responseId: data.created_at ? `ollama-${data.created_at}` : null,
+    tokens: pTok || oTok ? { prompt: pTok, output: oTok, total: pTok + oTok } : null,
+  };
 }
 
 async function extractWithGemini(params: {
   base64Data?: string;
   mimeType?: string;
   documentText?: string;
-}): Promise<{ extracted: ExtractedDocument; engine: string }> {
+}): Promise<{
+  extracted: ExtractedDocument;
+  engine: string;
+  responseId: string | null;
+  tokens: { prompt: number; output: number; total: number } | null;
+}> {
   const ai = requireGeminiClient();
   const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
   if (params.base64Data && params.mimeType) {
@@ -380,6 +402,7 @@ async function extractWithGemini(params: {
   });
 
   const parsed = JSON.parse((response.text ?? "{}").trim()) as ExtractedDocument;
+  const usage = response.usageMetadata;
   return {
     extracted: {
       ...parsed,
@@ -387,6 +410,14 @@ async function extractWithGemini(params: {
       line_items: parsed.line_items || [],
     },
     engine: MODEL_NAME,
+    responseId: response.responseId ?? null,
+    tokens: usage
+      ? {
+          prompt: Number(usage.promptTokenCount ?? 0),
+          output: Number(usage.candidatesTokenCount ?? 0),
+          total: Number(usage.totalTokenCount ?? 0),
+        }
+      : null,
   };
 }
 
@@ -396,8 +427,13 @@ async function synthesizeInvestigation(params: {
   payments: Record<string, unknown>[];
   evaluation: PolicyEvaluation;
   retrievedPolicies: RetrievedPolicyHit[];
-}): Promise<InvestigationBrief> {
-  const ai = requireGeminiClient();
+  engineChoice?: "gemini" | "ollama";
+}): Promise<{
+  brief: InvestigationBrief;
+  engine: string;
+  responseId: string | null;
+  tokens: { prompt: number; output: number; total: number } | null;
+}> {
   const promptPayload = {
     extracted_document: params.extracted,
     matched_purchase_order: params.po,
@@ -412,51 +448,99 @@ async function synthesizeInvestigation(params: {
     })),
   };
 
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: JSON.stringify(promptPayload, null, 2),
-    config: {
-      systemInstruction:
-        "You are a Senior Accounts Payable Investigation Agent for a Kenyan enterprise. " +
-        "Given the extracted invoice/receipt, SQLite PO & payment records, deterministic guardrail results, and the retrieved company policies, " +
-        "diagnose the root cause in plain accountant language, cite ONLY policy_id values present in retrieved_company_policies, " +
-        "recommend 'approve', 'hold', or 'reject' (note: if deterministic outcome is 'blocked', you MUST recommend 'reject'), " +
-        "and draft a concise audit note ready for the reviewer.",
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          root_cause: { type: Type.STRING },
-          explanation: { type: Type.STRING },
-          recommended_action: { type: Type.STRING },
-          confidence_label: { type: Type.STRING },
-          cited_policies: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                policy_id: { type: Type.STRING },
-                title: { type: Type.STRING },
-                relevance_reason: { type: Type.STRING },
-              },
-              required: ["policy_id", "title", "relevance_reason"],
-            },
-          },
-          draft_audit_note: { type: Type.STRING },
-        },
-        required: [
-          "root_cause",
-          "explanation",
-          "recommended_action",
-          "confidence_label",
-          "cited_policies",
-          "draft_audit_note",
-        ],
-      },
-    },
-  });
+  const systemInstruction =
+    "You are a Senior Accounts Payable Investigation Agent for a Kenyan enterprise. " +
+    "Given the extracted invoice/receipt, SQLite PO & payment records, deterministic guardrail results, and the retrieved company policies, " +
+    "diagnose the root cause in plain accountant language, cite ONLY policy_id values present in retrieved_company_policies, " +
+    "recommend 'approve', 'hold', or 'reject' (note: if deterministic outcome is 'blocked', you MUST recommend 'reject'), " +
+    "and draft a concise audit note ready for the reviewer.";
 
-  const brief = JSON.parse((response.text ?? "{}").trim()) as InvestigationBrief;
+  let brief: InvestigationBrief;
+  let usedEngine = MODEL_NAME;
+  let responseId: string | null = null;
+  let tokens: { prompt: number; output: number; total: number } | null = null;
+
+  if (params.engineChoice === "ollama" && process.env.OLLAMA_BASE_URL) {
+    const model = process.env.OLLAMA_MODEL || "qwen3:4b";
+    const resp = await fetch(`${process.env.OLLAMA_BASE_URL.replace(/\/$/, "")}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: JSON.stringify(promptPayload, null, 2) },
+        ],
+        stream: false,
+        format: "json",
+        options: { temperature: 0 },
+      }),
+    });
+    if (!resp.ok) throw new Error(`Ollama synthesis returned HTTP ${resp.status}`);
+    const data = (await resp.json()) as {
+      message?: { content?: string };
+      created_at?: string;
+      prompt_eval_count?: number;
+      eval_count?: number;
+    };
+    brief = JSON.parse(data.message?.content || "{}") as InvestigationBrief;
+    usedEngine = `ollama:${model}`;
+    responseId = data.created_at ? `ollama-${data.created_at}` : null;
+    const pTok = Number(data.prompt_eval_count ?? 0);
+    const oTok = Number(data.eval_count ?? 0);
+    tokens = pTok || oTok ? { prompt: pTok, output: oTok, total: pTok + oTok } : null;
+  } else {
+    const ai = requireGeminiClient();
+    const response = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: JSON.stringify(promptPayload, null, 2),
+      config: {
+        systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            root_cause: { type: Type.STRING },
+            explanation: { type: Type.STRING },
+            recommended_action: { type: Type.STRING },
+            confidence_label: { type: Type.STRING },
+            cited_policies: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  policy_id: { type: Type.STRING },
+                  title: { type: Type.STRING },
+                  relevance_reason: { type: Type.STRING },
+                },
+                required: ["policy_id", "title", "relevance_reason"],
+              },
+            },
+            draft_audit_note: { type: Type.STRING },
+          },
+          required: [
+            "root_cause",
+            "explanation",
+            "recommended_action",
+            "confidence_label",
+            "cited_policies",
+            "draft_audit_note",
+          ],
+        },
+      },
+    });
+    brief = JSON.parse((response.text ?? "{}").trim()) as InvestigationBrief;
+    responseId = response.responseId ?? null;
+    const usage = response.usageMetadata;
+    tokens = usage
+      ? {
+          prompt: Number(usage.promptTokenCount ?? 0),
+          output: Number(usage.candidatesTokenCount ?? 0),
+          total: Number(usage.totalTokenCount ?? 0),
+        }
+      : null;
+  }
+
   const validAction =
     params.evaluation.outcome === "blocked"
       ? "reject"
@@ -469,10 +553,15 @@ async function synthesizeInvestigation(params: {
       : "Medium";
 
   return {
-    ...brief,
-    recommended_action: validAction,
-    confidence_label: validConf,
-    cited_policies: brief.cited_policies || [],
+    brief: {
+      ...brief,
+      recommended_action: validAction,
+      confidence_label: validConf,
+      cited_policies: brief.cited_policies || [],
+    },
+    engine: usedEngine,
+    responseId,
+    tokens,
   };
 }
 
@@ -570,10 +659,11 @@ async function startServer() {
       }
 
       // Stage 1: Multimodal / Structured Document Extraction
-      const { extracted, engine: extractionEngine } =
+      const extractRes =
         engine === "ollama"
           ? await extractWithOllama({ base64Data, mimeType, documentText })
           : await extractWithGemini({ base64Data, mimeType, documentText });
+      const { extracted, engine: extractionEngine } = extractRes;
 
       const isReceipt = extracted.document_type === "receipt";
       const currency: Currency = extracted.currency?.toUpperCase() === "USD" ? "USD" : "KES";
@@ -679,13 +769,15 @@ async function startServer() {
       const ragResult = await vectorStore.search(ragQuery, 6);
 
       // Stage 4: AI Investigation Agent Synthesis grounded in SQL + Vector DB Policies
-      const investigation = await synthesizeInvestigation({
+      const synthRes = await synthesizeInvestigation({
         extracted,
         po: matchedPO as unknown as Record<string, unknown> | null,
         payments: matchedPayments as unknown as Record<string, unknown>[],
         evaluation,
         retrievedPolicies: ragResult.hits,
+        engineChoice: engine,
       });
+      const investigation = synthRes.brief;
 
       const latency_ms = Math.round(performance.now() - t0);
       const thread_id = `thr-${isReceipt ? "rcpt" : "inv"}-${Date.now().toString(36)}`;
@@ -721,6 +813,10 @@ async function startServer() {
         );
       }
 
+      const verifiedLive = Boolean(
+        (extractRes.responseId || extractRes.tokens) && (synthRes.responseId || synthRes.tokens)
+      );
+
       const thread: ReconciliationThread = {
         thread_id,
         created_at: new Date().toISOString(),
@@ -743,8 +839,20 @@ async function startServer() {
         evaluation,
         investigation,
         engine_meta: {
+          provider: engine === "ollama" ? "Local Ollama" : "Gemini Cloud",
+          verified_live: verifiedLive,
           extraction_engine: extractionEngine,
+          extraction_role: `Parsed ${extracted.document_type} header & ${extracted.line_items.length} line item(s) via strict JSON schema`,
+          extraction_response_id: extractRes.responseId,
+          extraction_tokens: extractRes.tokens,
           embedding_engine: ragResult.embedding_engine,
+          embedding_role: `Embedded query & ranked ${ragResult.total_searched} policies (${ragResult.dense_hits_count} dense cosine hits)`,
+          vector_dimension: ragResult.vector_dimension,
+          dense_hits_count: ragResult.dense_hits_count,
+          synthesis_engine: synthRes.engine,
+          synthesis_role: `Diagnosed root cause & cited ${investigation.cited_policies.length} Policy ID(s) from Vector DB`,
+          synthesis_response_id: synthRes.responseId,
+          synthesis_tokens: synthRes.tokens,
           latency_ms,
           vector_count_searched: ragResult.total_searched,
         },
@@ -754,8 +862,9 @@ async function startServer() {
         thread,
         latency_ms,
         "ai_investigator",
-        `${effectiveInvoiceNo || fileName || "Document"} investigated (${latency_ms}ms) -> cited ${investigation.cited_policies.map((c) => c.policy_id).join(", ") || "none"} -> ${threadStatus}.`,
+        `${effectiveInvoiceNo || fileName || "Document"} investigated (${latency_ms}ms) via ${synthRes.engine} -> cited ${investigation.cited_policies.map((c) => c.policy_id).join(", ") || "none"} -> ${threadStatus}.`,
         {
+          engine_meta: thread.engine_meta,
           extracted,
           retrieved_policy_ids: ragResult.hits.map((h) => ({ id: h.policy_id, score: h.similarity_score })),
           evaluation,

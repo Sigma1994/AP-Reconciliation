@@ -194,19 +194,29 @@ def reconcile(req: ReconcileRequest) -> dict[str, Any]:
     snap = app.state.recon_graph.get_state(cfg)
     vals = snap.values
     if snap.next:
+        inv_brief = vals.get("investigation", {})
         return {
             "thread_id": tid,
             "status": "pending_approval",
             "evidence": vals.get("match_report"),
             "retrieved_policies": vals.get("retrieved_policies", []),
-            "investigation": vals.get("investigation", {}),
+            "investigation": inv_brief,
+            "ai_verification": {
+                "parse_source": vals.get("parse_source"),
+                **(inv_brief.get("ai_verification") or {}),
+            },
         }
+    inv_brief = vals.get("investigation", {})
     return {
         "thread_id": tid,
         "status": vals.get("outcome_status"),
         "reconciliation_id": vals.get("reconciliation_id"),
         "retrieved_policies": vals.get("retrieved_policies", []),
-        "investigation": vals.get("investigation", {}),
+        "investigation": inv_brief,
+        "ai_verification": {
+            "parse_source": vals.get("parse_source"),
+            **(inv_brief.get("ai_verification") or {}),
+        },
         "final_response": vals.get("final_response"),
     }
 

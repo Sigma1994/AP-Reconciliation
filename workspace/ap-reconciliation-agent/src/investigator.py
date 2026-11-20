@@ -101,6 +101,15 @@ def _deterministic_brief(report: dict[str, Any], retrieved: list[dict[str, Any]]
         "cited_policies": cited,
         "draft_audit_note": note,
         "engine": "deterministic_policy_synthesizer",
+        "ai_verification": {
+            "live_model_used": False,
+            "embedding_engine": "local_hash_256d",
+            "vector_dimension": 256,
+            "synthesis_engine": "deterministic_policy_synthesizer",
+            "synthesis_role": "Policy-grounded deterministic synthesis (USE_DETERMINISTIC_LLM=1 or offline fallback)",
+            "response_id": None,
+            "token_usage": None,
+        },
     }
 
 
@@ -131,7 +140,10 @@ def investigate_variance(
     retrieved = rag_result["hits"]
 
     if os.getenv("USE_DETERMINISTIC_LLM", "0").strip().lower() in {"1", "true", "yes"}:
-        return rag_result, _deterministic_brief(report, retrieved)
+        det = _deterministic_brief(report, retrieved)
+        det["ai_verification"]["embedding_engine"] = rag_result.get("embedding_engine")
+        det["ai_verification"]["vector_dimension"] = rag_result.get("vector_dimension")
+        return rag_result, det
 
     payload = {
         "invoice": report.get("invoice"),
@@ -166,6 +178,8 @@ def investigate_variance(
 
     raw_text = ""
     used_engine = "deterministic_policy_synthesizer"
+    response_id: str | None = None
+    token_usage: dict[str, int] | None = None
     engine_pref = os.getenv("AP_AI_ENGINE", "ollama").strip().lower()
 
     try:
@@ -181,6 +195,14 @@ def investigate_variance(
             )
             raw_text = resp.text or ""
             used_engine = f"gemini:{model}"
+            response_id = getattr(resp, "response_id", None)
+            usage = getattr(resp, "usage_metadata", None)
+            if usage is not None:
+                token_usage = {
+                    "prompt": int(getattr(usage, "prompt_token_count", 0) or 0),
+                    "output": int(getattr(usage, "candidates_token_count", 0) or 0),
+                    "total": int(getattr(usage, "total_token_count", 0) or 0),
+                }
         elif os.getenv("OLLAMA_BASE_URL"):
             from langchain_ollama import ChatOllama  # type: ignore
 
@@ -192,14 +214,32 @@ def investigate_variance(
                 format="json",
                 client_kwargs={"timeout": float(os.getenv("OLLAMA_TEXT_TIMEOUT", "90"))},
             )
-            raw_text = str(llm.invoke([("system", system_msg), ("human", json.dumps(payload, default=str))]).content)
+            ai_msg = llm.invoke([("system", system_msg), ("human", json.dumps(payload, default=str))])
+            raw_text = str(ai_msg.content)
             used_engine = f"ollama:{model}"
+            meta = getattr(ai_msg, "response_metadata", None) or {}
+            if meta.get("created_at"):
+                response_id = f"ollama-{meta['created_at']}"
+            if meta.get("prompt_eval_count") or meta.get("eval_count"):
+                p_tok = int(meta.get("prompt_eval_count") or 0)
+                o_tok = int(meta.get("eval_count") or 0)
+                token_usage = {"prompt": p_tok, "output": o_tok, "total": p_tok + o_tok}
     except Exception:
         raw_text = ""
 
     parsed = _extract_json_obj(raw_text)
     if not parsed:
-        return rag_result, _deterministic_brief(report, retrieved)
+        det = _deterministic_brief(report, retrieved)
+        det["ai_verification"] = {
+            "live_model_used": False,
+            "embedding_engine": rag_result.get("embedding_engine"),
+            "vector_dimension": rag_result.get("vector_dimension"),
+            "synthesis_engine": "deterministic_policy_synthesizer",
+            "synthesis_role": "Policy-grounded fallback synthesizer (USE_DETERMINISTIC_LLM=1 or LLM unreachable)",
+            "response_id": None,
+            "token_usage": None,
+        }
+        return rag_result, det
 
     valid_ids = {p["policy_id"]: p["title"] for p in retrieved}
     raw_cited = parsed.get("cited_policies") if isinstance(parsed.get("cited_policies"), list) else []
@@ -222,12 +262,22 @@ def investigate_variance(
 
     conf = parsed.get("confidence_label") if parsed.get("confidence_label") in {"High", "Medium", "Low"} else "Medium"
     fallback = _deterministic_brief(report, retrieved)
+    cited_final = clean_cited or fallback["cited_policies"]
     return rag_result, {
         "root_cause": str(parsed.get("root_cause") or fallback["root_cause"]),
         "explanation": str(parsed.get("explanation") or fallback["explanation"]),
         "recommended_action": action,
         "confidence_label": conf,
-        "cited_policies": clean_cited or fallback["cited_policies"],
+        "cited_policies": cited_final,
         "draft_audit_note": str(parsed.get("draft_audit_note") or fallback["draft_audit_note"]),
         "engine": used_engine,
+        "ai_verification": {
+            "live_model_used": True,
+            "embedding_engine": rag_result.get("embedding_engine"),
+            "vector_dimension": rag_result.get("vector_dimension"),
+            "synthesis_engine": used_engine,
+            "synthesis_role": f"Diagnosed root cause & cited {len(cited_final)} Policy ID(s) from Vector DB",
+            "response_id": response_id,
+            "token_usage": token_usage,
+        },
     }

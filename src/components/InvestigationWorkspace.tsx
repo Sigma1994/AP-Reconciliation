@@ -3,11 +3,13 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  Cpu,
   Database,
   FileText,
   Loader2,
   Pause,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Upload,
   X,
@@ -491,6 +493,99 @@ export function InvestigationWorkspace({
                     </div>
                   </div>
                 )}
+              </div>
+
+              {/* AI Engine Verification & Execution Proof */}
+              <div className="rounded-xl border border-slate-800 bg-[#111A2E] p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                  <div className="flex items-center gap-2">
+                    <Cpu className="h-4 w-4 text-slate-300" />
+                    <h3 className="font-display text-sm font-semibold text-slate-100">
+                      AI Engine Verification & Execution Trace
+                    </h3>
+                  </div>
+                  {active.engine_meta.verified_live ? (
+                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      Live AI Call Verified ({active.engine_meta.provider || "Gemini Cloud"})
+                    </span>
+                  ) : (
+                    <span className="text-xs font-medium text-slate-400">
+                      {active.engine_meta.provider || "Pre-seeded Snapshot"} · Run a document to capture live API proof
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-3 text-xs">
+                  <div className="rounded-lg border border-slate-800 bg-[#0B1120] p-3 space-y-1.5">
+                    <div className="text-slate-400 font-medium">Stage 1 · Document Extraction</div>
+                    <div className="font-mono font-semibold text-blue-300">
+                      {active.engine_meta.extraction_engine}
+                    </div>
+                    <p className="text-slate-300 leading-relaxed">
+                      {active.engine_meta.extraction_role ||
+                        "Extracted header fields, KRA eTIMS CU, and line items into strict JSON."}
+                    </p>
+                    <div className="pt-1 font-mono text-[11px] text-slate-500 space-y-0.5 tabular-nums">
+                      {active.engine_meta.extraction_response_id && (
+                        <div className="truncate" title={active.engine_meta.extraction_response_id}>
+                          ID: {active.engine_meta.extraction_response_id}
+                        </div>
+                      )}
+                      {active.engine_meta.extraction_tokens && (
+                        <div>
+                          Tokens: {active.engine_meta.extraction_tokens.prompt} in /{" "}
+                          {active.engine_meta.extraction_tokens.output} out
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-800 bg-[#0B1120] p-3 space-y-1.5">
+                    <div className="text-slate-400 font-medium">Stage 3 · Vector DB Policy RAG</div>
+                    <div className="font-mono font-semibold text-blue-300">
+                      {active.engine_meta.embedding_engine}
+                    </div>
+                    <p className="text-slate-300 leading-relaxed">
+                      {active.engine_meta.embedding_role ||
+                        `Ranked ${active.engine_meta.vector_count_searched} SQLite policy clauses by cosine similarity.`}
+                    </p>
+                    <div className="pt-1 font-mono text-[11px] text-slate-500 space-y-0.5 tabular-nums">
+                      {active.engine_meta.vector_dimension && (
+                        <div>Embedding Dim: {active.engine_meta.vector_dimension}d</div>
+                      )}
+                      {typeof active.engine_meta.dense_hits_count === "number" && (
+                        <div>
+                          Dense Cosine Hits: {active.engine_meta.dense_hits_count}/{active.retrieved_policies.length}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-800 bg-[#0B1120] p-3 space-y-1.5">
+                    <div className="text-slate-400 font-medium">Stage 4 · Investigation Synthesis</div>
+                    <div className="font-mono font-semibold text-blue-300">
+                      {active.engine_meta.synthesis_engine || active.engine_meta.extraction_engine}
+                    </div>
+                    <p className="text-slate-300 leading-relaxed">
+                      {active.engine_meta.synthesis_role ||
+                        `Diagnosed variance root cause and cited ${active.investigation.cited_policies.length} Policy ID(s).`}
+                    </p>
+                    <div className="pt-1 font-mono text-[11px] text-slate-500 space-y-0.5 tabular-nums">
+                      {active.engine_meta.synthesis_response_id && (
+                        <div className="truncate" title={active.engine_meta.synthesis_response_id}>
+                          ID: {active.engine_meta.synthesis_response_id}
+                        </div>
+                      )}
+                      {active.engine_meta.synthesis_tokens && (
+                        <div>
+                          Tokens: {active.engine_meta.synthesis_tokens.prompt} in /{" "}
+                          {active.engine_meta.synthesis_tokens.output} out
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
               </div>
 
               {/* Accountant Decision Panel */}

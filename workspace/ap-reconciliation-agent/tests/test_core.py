@@ -97,6 +97,10 @@ class CoreAPReconciliationTests(unittest.TestCase):
         self.assertTrue(cited1.issubset(retrieved1))
         self.assertIn("SOP-VEND-001", cited1)
         self.assertEqual(brief1["recommended_action"], "approve")
+        self.assertIn("ai_verification", brief1)
+        self.assertEqual(brief1["ai_verification"]["embedding_engine"], "local_hash_256d")
+        self.assertEqual(brief1["ai_verification"]["vector_dimension"], 256)
+        self.assertFalse(brief1["ai_verification"]["live_model_used"])
 
         # 2) Nairobi Legal 5% WHT case -> flags wht_5pct, cites SOP-VEND-006
         rep5 = evaluate_match("INV-9005", db_path=self.db_path)

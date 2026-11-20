@@ -354,8 +354,12 @@ export class WorkbenchDB {
           draft_audit_note: "Verified 'ACACIA HDW' against PO-4410 (Acacia Hardware Ltd) and confirmed KES 2,000 deduction matches 2% WHVAT under POL-TAX-003 / SOP-VEND-001.",
         }),
         JSON.stringify({
+          provider: "Seeded Ledger Snapshot",
+          verified_live: false,
           extraction_engine: "gemini-4-hydrogen",
+          extraction_role: "Pre-seeded example — run a document on the left for live AI verification",
           embedding_engine: "gemini-embedding-2",
+          synthesis_engine: "gemini-4-hydrogen",
           latency_ms: 412,
           vector_count_searched: KENYAN_AP_POLICIES.length,
         })
@@ -454,8 +458,12 @@ export class WorkbenchDB {
           draft_audit_note: "Held per SOP-VEND-002: KES 17,000 short-payment on INV-9004 reflects disputed demurrage; awaiting supplier Credit Note.",
         }),
         JSON.stringify({
+          provider: "Seeded Ledger Snapshot",
+          verified_live: false,
           extraction_engine: "gemini-4-hydrogen",
+          extraction_role: "Pre-seeded example — run a document on the left for live AI verification",
           embedding_engine: "gemini-embedding-2",
+          synthesis_engine: "gemini-4-hydrogen",
           latency_ms: 388,
           vector_count_searched: KENYAN_AP_POLICIES.length,
         })

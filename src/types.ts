@@ -155,8 +155,20 @@ export interface ReconciliationThread {
   evaluation: PolicyEvaluation;
   investigation: InvestigationBrief;
   engine_meta: {
+    provider?: string;
+    verified_live?: boolean;
     extraction_engine: string;
+    extraction_role?: string;
+    extraction_response_id?: string | null;
+    extraction_tokens?: { prompt: number; output: number; total: number } | null;
     embedding_engine: string;
+    embedding_role?: string;
+    vector_dimension?: number | null;
+    dense_hits_count?: number;
+    synthesis_engine?: string;
+    synthesis_role?: string;
+    synthesis_response_id?: string | null;
+    synthesis_tokens?: { prompt: number; output: number; total: number } | null;
     latency_ms: number;
     vector_count_searched: number;
   };

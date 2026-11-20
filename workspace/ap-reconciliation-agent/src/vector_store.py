@@ -234,8 +234,12 @@ class PolicyVectorStore:
             )
 
         hits.sort(key=lambda h: h["similarity_score"], reverse=True)
+        top_hits = hits[:top_k]
+        eng = sync_info.get("engine") or q_engine
         return {
-            "hits": hits[:top_k],
-            "embedding_engine": sync_info.get("engine") or q_engine,
+            "hits": top_hits,
+            "embedding_engine": eng,
+            "vector_dimension": len(q_vec),
+            "neural_embedding_used": eng != "local_hash_256d",
             "total_searched": len(policies),
         }

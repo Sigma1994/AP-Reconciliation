@@ -120,7 +120,13 @@ export class PolicyVectorStore {
   async search(
     query: string,
     topK = 6
-  ): Promise<{ hits: RetrievedPolicyHit[]; embedding_engine: string; total_searched: number }> {
+  ): Promise<{
+    hits: RetrievedPolicyHit[];
+    embedding_engine: string;
+    total_searched: number;
+    vector_dimension: number | null;
+    dense_hits_count: number;
+  }> {
     const policies = this.db.getPolicies();
     let embeddingEngine = "lexical_hybrid";
     let queryVector: number[] | null = null;
@@ -173,10 +179,13 @@ export class PolicyVectorStore {
     });
 
     scored.sort((a, b) => b.similarity_score - a.similarity_score);
+    const topHits = scored.slice(0, topK);
     return {
-      hits: scored.slice(0, topK),
+      hits: topHits,
       embedding_engine: embeddingEngine,
       total_searched: policies.length,
+      vector_dimension: queryVector ? queryVector.length : null,
+      dense_hits_count: topHits.filter((h) => h.retrieval_mode === "dense_vector").length,
     };
   }
 }
