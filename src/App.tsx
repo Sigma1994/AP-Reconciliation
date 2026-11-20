@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { BookOpenCheck, Database, RotateCcw, Sparkles } from "lucide-react";
+import { BookOpenCheck, Cpu, Database, RotateCcw, Sparkles } from "lucide-react";
 import type { PolicyCategory, ReconciliationThread, WorkbenchState } from "./types";
+import { AiProcessGuide } from "./components/AiProcessGuide";
 import { InvestigationWorkspace } from "./components/InvestigationWorkspace";
 import { PolicyKnowledgeBase } from "./components/PolicyKnowledgeBase";
 import { StepLedger } from "./components/StepLedger";
 
-type ViewKey = "investigate" | "policies" | "ledger";
+type ViewKey = "investigate" | "policies" | "ledger" | "process";
 
 const NAV_ITEMS: {
   key: ViewKey;
@@ -30,6 +31,12 @@ const NAV_ITEMS: {
     label: "3. Ledger & Audit",
     breadcrumb: "SQLite Ledger & Append-Only Audit",
     icon: BookOpenCheck,
+  },
+  {
+    key: "process",
+    label: "4. AI & ML Process",
+    breadcrumb: "End-to-End AI & ML Architecture",
+    icon: Cpu,
   },
 ];
 
@@ -287,6 +294,7 @@ export default function App() {
                   />
                 )}
                 {view === "ledger" && <StepLedger state={state} />}
+                {view === "process" && <AiProcessGuide state={state} />}
               </>
             )}
           </div>

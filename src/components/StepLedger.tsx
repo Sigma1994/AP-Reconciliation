@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, FileText, Loader2 } from "lucide-react";
 import type { WorkbenchState } from "../types";
 import { formatMoney, formatTimestamp, statusDisplay } from "./Formatters";
 
@@ -10,6 +10,9 @@ interface StepLedgerProps {
 export function StepLedger({ state }: StepLedgerProps) {
   const [filter, setFilter] = useState<"all" | "reconciled" | "open">("all");
   const [expandedAuditId, setExpandedAuditId] = useState<number | null>(null);
+  const [exporting, setExporting] = useState<"csv" | "pdf" | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   const filteredInvoices = state.invoices.filter((inv) => {
     if (filter === "all") return true;
@@ -17,16 +20,94 @@ export function StepLedger({ state }: StepLedgerProps) {
     return inv.status !== "reconciled";
   });
 
+  async function handleExport(format: "csv" | "pdf") {
+    setExporting(format);
+    setExportError(null);
+    setExportNotice(null);
+    try {
+      const res = await fetch(`/api/ledger/export?format=${format}&filter=${filter}`);
+      if (!res.ok) {
+        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(errBody.error || `Export failed (${res.status})`);
+      }
+      const digest = res.headers.get("X-Ledger-Sha256") || "";
+      const disposition = res.headers.get("Content-Disposition") || "";
+      const nameMatch = /filename="([^"]+)"/.exec(disposition);
+      const fileName =
+        nameMatch?.[1] || `ap-ledger-${filter}-${new Date().toISOString().slice(0, 10)}.${format}`;
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+
+      setExportNotice(
+        `Downloaded ${fileName}${digest ? ` · Snapshot SHA-256: ${digest.slice(0, 16)}...` : ""}`
+      );
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Could not export ledger.");
+    } finally {
+      setExporting(null);
+    }
+  }
+
   return (
     <div className="space-y-8">
-      <div className="max-w-2xl space-y-1.5">
-        <h1 className="font-display text-2xl font-semibold tracking-tight text-slate-100">
-          SQLite Ledger and Append-Only Audit Trail
-        </h1>
-        <p className="text-sm leading-relaxed text-slate-400">
-          Live operational ledger in <code className="text-slate-300">data/workbench.db</code> (WAL mode). Cleared invoices are locked monotonically, and <code className="text-slate-300">audit_log</code> is protected by SQLite update/delete abort triggers.
-        </p>
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        <div className="max-w-2xl space-y-1.5">
+          <h1 className="font-display text-2xl font-semibold tracking-tight text-slate-100">
+            SQLite Ledger and Append-Only Audit Trail
+          </h1>
+          <p className="text-sm leading-relaxed text-slate-400">
+            Live operational ledger in <code className="text-slate-300">data/workbench.db</code> (WAL mode). Cleared invoices are locked monotonically, and <code className="text-slate-300">audit_log</code> is protected by SQLite update/delete abort triggers.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2.5 self-start">
+          <button
+            type="button"
+            disabled={exporting !== null}
+            onClick={() => handleExport("csv")}
+            className="inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-[#111A2E] px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            {exporting === "csv" ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download className="h-3.5 w-3.5" />
+            )}
+            Export CSV ({filter === "all" ? "Full Ledger" : filter === "reconciled" ? "Cleared" : "Open / Held"})
+          </button>
+          <button
+            type="button"
+            disabled={exporting !== null}
+            onClick={() => handleExport("pdf")}
+            className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            {exporting === "pdf" ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <FileText className="h-3.5 w-3.5" />
+            )}
+            Export Audit PDF
+          </button>
+        </div>
       </div>
+
+      {exportError && (
+        <div role="alert" className="rounded-lg border border-rose-500/40 bg-rose-950/40 px-4 py-3 text-sm text-rose-200">
+          {exportError}
+        </div>
+      )}
+      {exportNotice && (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/40 px-4 py-2.5 text-xs font-mono text-emerald-200">
+          {exportNotice}
+        </div>
+      )}
 
       {/* Telemetry Summary Strip */}
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-6">

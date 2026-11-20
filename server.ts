@@ -5,6 +5,7 @@ import express from "express";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import { WorkbenchDB, sha16 } from "./src/db.ts";
+import { buildLedgerSnapshot, renderLedgerCsv, renderLedgerPdf, type LedgerFilter } from "./src/ledgerExport.ts";
 import { PolicyVectorStore } from "./src/vectorStore.ts";
 import type {
   Currency,
@@ -576,6 +577,41 @@ async function startServer() {
 
   app.get("/api/workbench", (_req, res) => {
     res.json(db.getState());
+  });
+
+  app.get("/api/ledger/export", (req, res) => {
+    const rawFormat = String(req.query.format || "csv").toLowerCase();
+    const rawFilter = String(req.query.filter || "all").toLowerCase();
+    const filter: LedgerFilter =
+      rawFilter === "reconciled" || rawFilter === "open" ? rawFilter : "all";
+
+    if (rawFormat !== "csv" && rawFormat !== "pdf") {
+      res.status(400).json({ error: "Export format must be 'csv' or 'pdf'." });
+      return;
+    }
+
+    const snapshot = buildLedgerSnapshot(db.getState(), filter);
+    const stamp = snapshot.exportedAt.slice(0, 10);
+    res.setHeader("X-Ledger-Sha256", snapshot.digestSha256);
+
+    if (rawFormat === "csv") {
+      const csv = renderLedgerCsv(snapshot);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="ap-immutable-ledger-${filter}-${stamp}.csv"`
+      );
+      res.send(csv);
+      return;
+    }
+
+    const pdfBuf = renderLedgerPdf(snapshot);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="ap-audit-report-${filter}-${stamp}.pdf"`
+    );
+    res.send(pdfBuf);
   });
 
   app.post("/api/workbench/reset", async (_req, res) => {
