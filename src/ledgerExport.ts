@@ -3,9 +3,20 @@ import type { WorkbenchState } from "./types.ts";
 
 export type LedgerFilter = "all" | "reconciled" | "open";
 
+export interface LedgerQueryFilter {
+  status: LedgerFilter;
+  vendor?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  minAmount?: number | null;
+  maxAmount?: number | null;
+}
+
 export interface FilteredLedgerSnapshot {
   exportedAt: string;
   filter: LedgerFilter;
+  query: LedgerQueryFilter;
+  hasCustomFilters: boolean;
   digestSha256: string;
   state: WorkbenchState;
   invoices: WorkbenchState["invoices"];
@@ -13,25 +24,70 @@ export interface FilteredLedgerSnapshot {
   auditLog: WorkbenchState["audit_log"];
 }
 
-export function buildLedgerSnapshot(state: WorkbenchState, filter: LedgerFilter = "all"): FilteredLedgerSnapshot {
+export function describeLedgerQuery(q: LedgerQueryFilter): string {
+  const parts: string[] = [`status=${q.status}`];
+  if (q.vendor?.trim()) parts.push(`vendor~"${q.vendor.trim()}"`);
+  if (q.dateFrom) parts.push(`from=${q.dateFrom}`);
+  if (q.dateTo) parts.push(`to=${q.dateTo}`);
+  if (q.minAmount !== null && q.minAmount !== undefined && Number.isFinite(q.minAmount)) {
+    parts.push(`min>=${q.minAmount}`);
+  }
+  if (q.maxAmount !== null && q.maxAmount !== undefined && Number.isFinite(q.maxAmount)) {
+    parts.push(`max<=${q.maxAmount}`);
+  }
+  return parts.join(" | ");
+}
+
+export function buildLedgerSnapshot(
+  state: WorkbenchState,
+  filterOrQuery: LedgerFilter | LedgerQueryFilter = "all"
+): FilteredLedgerSnapshot {
+  const query: LedgerQueryFilter =
+    typeof filterOrQuery === "string" ? { status: filterOrQuery } : filterOrQuery;
+  const filter = query.status;
+  const vendorNeedle = query.vendor?.trim().toLowerCase() || "";
+  const dateFrom = query.dateFrom?.trim() || "";
+  const dateTo = query.dateTo?.trim() || "";
+  const minAmount =
+    query.minAmount !== null && query.minAmount !== undefined && Number.isFinite(query.minAmount)
+      ? query.minAmount
+      : null;
+  const maxAmount =
+    query.maxAmount !== null && query.maxAmount !== undefined && Number.isFinite(query.maxAmount)
+      ? query.maxAmount
+      : null;
+
+  const hasCustomFilters = Boolean(
+    filter !== "all" || vendorNeedle || dateFrom || dateTo || minAmount !== null || maxAmount !== null
+  );
+
   const exportedAt = new Date().toISOString();
   const invoices = state.invoices.filter((inv) => {
-    if (filter === "reconciled") return inv.status === "reconciled";
-    if (filter === "open") return inv.status !== "reconciled";
+    if (filter === "reconciled" && inv.status !== "reconciled") return false;
+    if (filter === "open" && inv.status === "reconciled") return false;
+    if (vendorNeedle) {
+      const hay = `${inv.vendor_name} ${inv.invoice_number} ${inv.po_number || ""} ${inv.etims_cu || ""}`.toLowerCase();
+      if (!hay.includes(vendorNeedle)) return false;
+    }
+    if (dateFrom && inv.invoice_date < dateFrom) return false;
+    if (dateTo && inv.invoice_date > dateTo) return false;
+    if (minAmount !== null && inv.total < minAmount) return false;
+    if (maxAmount !== null && inv.total > maxAmount) return false;
     return true;
   });
 
   const invSet = new Set(invoices.map((i) => i.invoice_number.toUpperCase()));
-  const threads =
-    filter === "all"
-      ? state.threads
-      : state.threads.filter((t) => (t.invoice_number ? invSet.has(t.invoice_number.toUpperCase()) : filter === "open"));
+  const threads = !hasCustomFilters
+    ? state.threads
+    : state.threads.filter((t) =>
+        t.invoice_number ? invSet.has(t.invoice_number.toUpperCase()) : filter === "open" && !vendorNeedle && !dateFrom && !dateTo && minAmount === null && maxAmount === null
+      );
 
   const threadSet = new Set(threads.map((t) => t.thread_id));
-  const auditLog = filter === "all" ? state.audit_log : state.audit_log.filter((a) => threadSet.has(a.thread_id));
+  const auditLog = !hasCustomFilters ? state.audit_log : state.audit_log.filter((a) => threadSet.has(a.thread_id));
 
   const canonical = JSON.stringify({
-    filter,
+    query,
     purchase_orders: state.purchase_orders,
     invoices,
     payments: state.payments,
@@ -55,6 +111,8 @@ export function buildLedgerSnapshot(state: WorkbenchState, filter: LedgerFilter 
   return {
     exportedAt,
     filter,
+    query,
+    hasCustomFilters,
     digestSha256,
     state,
     invoices,
@@ -81,7 +139,7 @@ export function renderLedgerCsv(snapshot: FilteredLedgerSnapshot): string {
 
   lines.push(csvRow(["AP RECONCILIATION AI - IMMUTABLE LEDGER & AUDIT EXPORT"]));
   lines.push(csvRow(["Exported At (UTC)", snapshot.exportedAt]));
-  lines.push(csvRow(["Scope Filter", snapshot.filter]));
+  lines.push(csvRow(["Scope Filter", describeLedgerQuery(snapshot.query)]));
   lines.push(csvRow(["Ledger Snapshot SHA-256", snapshot.digestSha256]));
   lines.push(
     csvRow([
@@ -302,7 +360,14 @@ export function renderLedgerPdf(snapshot: FilteredLedgerSnapshot): Buffer {
   // Title & Integrity Metadata Block
   drawText(MARGIN, y, "Immutable Accounts Payable Ledger & Audit Export", "F2", 15, "0.06 0.10 0.18");
   y -= 16;
-  drawText(MARGIN, y, `Generated (UTC): ${snapshot.exportedAt}   |   Scope Filter: ${snapshot.filter.toUpperCase()}`, "F1", 8.5, "0.32 0.38 0.48");
+  drawText(
+    MARGIN,
+    y,
+    `Generated (UTC): ${snapshot.exportedAt}   |   Scope: ${describeLedgerQuery(snapshot.query)}`,
+    "F1",
+    8.2,
+    "0.32 0.38 0.48"
+  );
   y -= 13;
   drawText(MARGIN, y, `Integrity Seal (SHA-256): ${snapshot.digestSha256}`, "F3", 7.8, "0.10 0.28 0.52");
   y -= 12;

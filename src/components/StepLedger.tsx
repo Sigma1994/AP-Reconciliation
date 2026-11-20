@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, Download, FileText, Loader2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, FileText, Loader2, RotateCcw, Search, X } from "lucide-react";
 import type { WorkbenchState } from "../types";
 import { formatMoney, formatTimestamp, statusDisplay } from "./Formatters";
 
@@ -9,23 +9,69 @@ interface StepLedgerProps {
 
 export function StepLedger({ state }: StepLedgerProps) {
   const [filter, setFilter] = useState<"all" | "reconciled" | "open">("all");
+  const [vendorQuery, setVendorQuery] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [minAmount, setMinAmount] = useState("");
+  const [maxAmount, setMaxAmount] = useState("");
   const [expandedAuditId, setExpandedAuditId] = useState<number | null>(null);
   const [exporting, setExporting] = useState<"csv" | "pdf" | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
+  const parsedMin = minAmount.trim() !== "" ? Number(minAmount) : null;
+  const parsedMax = maxAmount.trim() !== "" ? Number(maxAmount) : null;
+  const vendorNeedle = vendorQuery.trim().toLowerCase();
+
+  const hasDetailFilters = Boolean(
+    vendorNeedle ||
+      dateFrom ||
+      dateTo ||
+      (parsedMin !== null && Number.isFinite(parsedMin)) ||
+      (parsedMax !== null && Number.isFinite(parsedMax))
+  );
+  const hasAnyFilter = filter !== "all" || hasDetailFilters;
+
   const filteredInvoices = state.invoices.filter((inv) => {
-    if (filter === "all") return true;
-    if (filter === "reconciled") return inv.status === "reconciled";
-    return inv.status !== "reconciled";
+    if (filter === "reconciled" && inv.status !== "reconciled") return false;
+    if (filter === "open" && inv.status === "reconciled") return false;
+    if (vendorNeedle) {
+      const hay = `${inv.vendor_name} ${inv.invoice_number} ${inv.po_number || ""} ${inv.etims_cu || ""}`.toLowerCase();
+      if (!hay.includes(vendorNeedle)) return false;
+    }
+    if (dateFrom && inv.invoice_date < dateFrom) return false;
+    if (dateTo && inv.invoice_date > dateTo) return false;
+    if (parsedMin !== null && Number.isFinite(parsedMin) && inv.total < parsedMin) return false;
+    if (parsedMax !== null && Number.isFinite(parsedMax) && inv.total > parsedMax) return false;
+    return true;
   });
+
+  function resetFilters() {
+    setFilter("all");
+    setVendorQuery("");
+    setDateFrom("");
+    setDateTo("");
+    setMinAmount("");
+    setMaxAmount("");
+  }
 
   async function handleExport(format: "csv" | "pdf") {
     setExporting(format);
     setExportError(null);
     setExportNotice(null);
     try {
-      const res = await fetch(`/api/ledger/export?format=${format}&filter=${filter}`);
+      const qs = new URLSearchParams({ format, filter });
+      if (vendorQuery.trim()) qs.set("vendor", vendorQuery.trim());
+      if (dateFrom) qs.set("dateFrom", dateFrom);
+      if (dateTo) qs.set("dateTo", dateTo);
+      if (minAmount.trim() !== "" && parsedMin !== null && Number.isFinite(parsedMin)) {
+        qs.set("minAmount", minAmount.trim());
+      }
+      if (maxAmount.trim() !== "" && parsedMax !== null && Number.isFinite(parsedMax)) {
+        qs.set("maxAmount", maxAmount.trim());
+      }
+
+      const res = await fetch(`/api/ledger/export?${qs.toString()}`);
       if (!res.ok) {
         const errBody = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(errBody.error || `Export failed (${res.status})`);
@@ -34,7 +80,7 @@ export function StepLedger({ state }: StepLedgerProps) {
       const disposition = res.headers.get("Content-Disposition") || "";
       const nameMatch = /filename="([^"]+)"/.exec(disposition);
       const fileName =
-        nameMatch?.[1] || `ap-ledger-${filter}-${new Date().toISOString().slice(0, 10)}.${format}`;
+        nameMatch?.[1] || `ap-ledger-${hasDetailFilters ? "filtered" : filter}-${new Date().toISOString().slice(0, 10)}.${format}`;
 
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -80,7 +126,7 @@ export function StepLedger({ state }: StepLedgerProps) {
             ) : (
               <Download className="h-3.5 w-3.5" />
             )}
-            Export CSV ({filter === "all" ? "Full Ledger" : filter === "reconciled" ? "Cleared" : "Open / Held"})
+            Export CSV ({hasDetailFilters ? "Filtered" : filter === "all" ? "Full Ledger" : filter === "reconciled" ? "Cleared" : "Open / Held"})
           </button>
           <button
             type="button"
@@ -152,9 +198,14 @@ export function StepLedger({ state }: StepLedgerProps) {
       {/* Invoice Ledger Table */}
       <div className="rounded-xl border border-slate-800 bg-[#111A2E] overflow-hidden">
         <div className="flex flex-col gap-3 border-b border-slate-800 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-          <h2 className="font-display text-base font-semibold text-slate-100">
-            Accounts Payable Invoices
-          </h2>
+          <div className="flex items-center gap-3">
+            <h2 className="font-display text-base font-semibold text-slate-100">
+              Accounts Payable Invoices
+            </h2>
+            <span className="text-xs font-mono text-slate-400 tabular-nums">
+              Showing {filteredInvoices.length} of {state.invoices.length}
+            </span>
+          </div>
           <div className="inline-flex rounded-lg border border-slate-800 bg-[#0B1120] p-1 self-start">
             {(["all", "reconciled", "open"] as const).map((tab) => (
               <button
@@ -173,12 +224,119 @@ export function StepLedger({ state }: StepLedgerProps) {
           </div>
         </div>
 
+        {/* Search & Filter Bar */}
+        <div className="border-b border-slate-800 bg-[#0B1120]/60 px-5 py-3.5">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-12 lg:items-end">
+            <div className="lg:col-span-4">
+              <label htmlFor="ledger-vendor-search" className="block text-[11px] font-medium text-slate-400 mb-1">
+                Vendor Name or Reference
+              </label>
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+                <input
+                  id="ledger-vendor-search"
+                  type="text"
+                  value={vendorQuery}
+                  onChange={(e) => setVendorQuery(e.target.value)}
+                  placeholder="Search vendor, invoice #, PO, or eTIMS..."
+                  className="w-full rounded-lg border border-slate-700/80 bg-[#0B1120] py-1.5 pl-8 pr-8 text-xs text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
+                />
+                {vendorQuery && (
+                  <button
+                    type="button"
+                    aria-label="Clear vendor search"
+                    onClick={() => setVendorQuery("")}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:text-slate-200 cursor-pointer"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="lg:col-span-2">
+              <label htmlFor="ledger-date-from" className="block text-[11px] font-medium text-slate-400 mb-1">
+                Date From
+              </label>
+              <input
+                id="ledger-date-from"
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+                className="w-full rounded-lg border border-slate-700/80 bg-[#0B1120] px-2.5 py-1.5 text-xs font-mono text-slate-100 focus:border-blue-500 focus:outline-none [color-scheme:dark]"
+              />
+            </div>
+
+            <div className="lg:col-span-2">
+              <label htmlFor="ledger-date-to" className="block text-[11px] font-medium text-slate-400 mb-1">
+                Date To
+              </label>
+              <input
+                id="ledger-date-to"
+                type="date"
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+                className="w-full rounded-lg border border-slate-700/80 bg-[#0B1120] px-2.5 py-1.5 text-xs font-mono text-slate-100 focus:border-blue-500 focus:outline-none [color-scheme:dark]"
+              />
+            </div>
+
+            <div className="lg:col-span-3">
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label htmlFor="ledger-min-amount" className="block text-[11px] font-medium text-slate-400 mb-1">
+                    Min Amount
+                  </label>
+                  <input
+                    id="ledger-min-amount"
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={minAmount}
+                    onChange={(e) => setMinAmount(e.target.value)}
+                    placeholder="0"
+                    className="w-full rounded-lg border border-slate-700/80 bg-[#0B1120] px-2.5 py-1.5 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="ledger-max-amount" className="block text-[11px] font-medium text-slate-400 mb-1">
+                    Max Amount
+                  </label>
+                  <input
+                    id="ledger-max-amount"
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={maxAmount}
+                    onChange={(e) => setMaxAmount(e.target.value)}
+                    placeholder="Any"
+                    className="w-full rounded-lg border border-slate-700/80 bg-[#0B1120] px-2.5 py-1.5 text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:border-blue-500 focus:outline-none tabular-nums"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="lg:col-span-1 flex lg:justify-end">
+              <button
+                type="button"
+                disabled={!hasAnyFilter}
+                onClick={resetFilters}
+                className="inline-flex w-full lg:w-auto items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-[#111A2E] px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap cursor-pointer"
+                title="Reset all filters"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Reset
+              </button>
+            </div>
+          </div>
+        </div>
+
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="border-b border-slate-800 bg-[#0B1120] text-xs font-medium text-slate-400">
               <tr>
                 <th className="px-5 py-3">Invoice</th>
                 <th className="px-5 py-3">Vendor</th>
+                <th className="px-5 py-3">Invoice Date</th>
                 <th className="px-5 py-3">PO Ref</th>
                 <th className="px-5 py-3">eTIMS CU</th>
                 <th className="px-5 py-3 text-right">Total</th>
@@ -186,29 +344,50 @@ export function StepLedger({ state }: StepLedgerProps) {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800 tabular-nums">
-              {filteredInvoices.map((inv) => {
-                const st = statusDisplay(inv.status);
-                return (
-                  <tr key={inv.invoice_number} className="hover:bg-slate-800/30">
-                    <td className="px-5 py-3 font-mono text-xs font-semibold text-slate-100">
-                      {inv.invoice_number}
-                    </td>
-                    <td className="px-5 py-3 text-slate-200">{inv.vendor_name}</td>
-                    <td className="px-5 py-3 font-mono text-xs text-slate-400">
-                      {inv.po_number || "—"}
-                    </td>
-                    <td className="px-5 py-3 font-mono text-xs text-slate-400">
-                      {inv.etims_cu || "Missing"}
-                    </td>
-                    <td className="px-5 py-3 text-right font-mono text-slate-100">
-                      {formatMoney(inv.total, inv.currency)}
-                    </td>
-                    <td className={`px-5 py-3 text-right text-xs font-medium ${st.textClass}`}>
-                      {st.label}
-                    </td>
-                  </tr>
-                );
-              })}
+              {filteredInvoices.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-5 py-8 text-center text-sm text-slate-400">
+                    <div>No invoices match the active search or filter criteria.</div>
+                    {hasAnyFilter && (
+                      <button
+                        type="button"
+                        onClick={resetFilters}
+                        className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#0B1120] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 cursor-pointer"
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                        Clear filters
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ) : (
+                filteredInvoices.map((inv) => {
+                  const st = statusDisplay(inv.status);
+                  return (
+                    <tr key={inv.invoice_number} className="hover:bg-slate-800/30">
+                      <td className="px-5 py-3 font-mono text-xs font-semibold text-slate-100">
+                        {inv.invoice_number}
+                      </td>
+                      <td className="px-5 py-3 text-slate-200">{inv.vendor_name}</td>
+                      <td className="px-5 py-3 font-mono text-xs text-slate-400">
+                        {inv.invoice_date}
+                      </td>
+                      <td className="px-5 py-3 font-mono text-xs text-slate-400">
+                        {inv.po_number || "—"}
+                      </td>
+                      <td className="px-5 py-3 font-mono text-xs text-slate-400">
+                        {inv.etims_cu || "Missing"}
+                      </td>
+                      <td className="px-5 py-3 text-right font-mono text-slate-100">
+                        {formatMoney(inv.total, inv.currency)}
+                      </td>
+                      <td className={`px-5 py-3 text-right text-xs font-medium ${st.textClass}`}>
+                        {st.label}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>

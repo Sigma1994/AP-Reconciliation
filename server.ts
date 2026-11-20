@@ -590,8 +590,22 @@ async function startServer() {
       return;
     }
 
-    const snapshot = buildLedgerSnapshot(db.getState(), filter);
+    const vendor = typeof req.query.vendor === "string" ? req.query.vendor.trim() : "";
+    const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom.trim() : "";
+    const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo.trim() : "";
+    const minRaw = typeof req.query.minAmount === "string" && req.query.minAmount.trim() !== "" ? Number(req.query.minAmount) : null;
+    const maxRaw = typeof req.query.maxAmount === "string" && req.query.maxAmount.trim() !== "" ? Number(req.query.maxAmount) : null;
+
+    const snapshot = buildLedgerSnapshot(db.getState(), {
+      status: filter,
+      vendor: vendor || undefined,
+      dateFrom: dateFrom || undefined,
+      dateTo: dateTo || undefined,
+      minAmount: minRaw !== null && Number.isFinite(minRaw) ? minRaw : null,
+      maxAmount: maxRaw !== null && Number.isFinite(maxRaw) ? maxRaw : null,
+    });
     const stamp = snapshot.exportedAt.slice(0, 10);
+    const scopeTag = snapshot.hasCustomFilters ? "filtered" : filter;
     res.setHeader("X-Ledger-Sha256", snapshot.digestSha256);
 
     if (rawFormat === "csv") {
@@ -599,7 +613,7 @@ async function startServer() {
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="ap-immutable-ledger-${filter}-${stamp}.csv"`
+        `attachment; filename="ap-immutable-ledger-${scopeTag}-${stamp}.csv"`
       );
       res.send(csv);
       return;
@@ -609,7 +623,7 @@ async function startServer() {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="ap-audit-report-${filter}-${stamp}.pdf"`
+      `attachment; filename="ap-audit-report-${scopeTag}-${stamp}.pdf"`
     );
     res.send(pdfBuf);
   });
